@@ -257,6 +257,10 @@ class AgentLoop:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
             )
+        # Claude Code integration — delegate tasks to Claude Code CLI
+        from nanobot.agent.tools.claude_code import ClaudeCodeTool, ClaudeCodeSessionsTool
+        self.tools.register(ClaudeCodeTool(workspace=str(self.workspace)))
+        self.tools.register(ClaudeCodeSessionsTool())
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""

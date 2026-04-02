@@ -375,11 +375,55 @@ def _onboard_plugins(config_path: Path) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
+def _ensure_meridian(config: Config) -> None:
+    """Auto-start Meridian proxy if anthropic provider points to localhost:3456."""
+    import shutil
+    import socket
+    import subprocess
+
+    p = getattr(config.providers, "anthropic", None)
+    if not p or not p.api_base or "127.0.0.1:3456" not in p.api_base:
+        return
+
+    # Check if already running
+    try:
+        with socket.create_connection(("127.0.0.1", 3456), timeout=1):
+            return  # Already running
+    except OSError:
+        pass
+
+    meridian_bin = shutil.which("meridian")
+    if not meridian_bin:
+        console.print("[yellow]Warning: Meridian not installed. Run: npm install -g @rynfar/meridian[/yellow]")
+        return
+
+    console.print("[cyan]Starting Meridian proxy...[/cyan]")
+    env = {**__import__("os").environ, "MERIDIAN_SONNET_MODEL": "sonnet", "MERIDIAN_PASSTHROUGH": "1"}
+    subprocess.Popen(
+        [meridian_bin],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Wait for it to be ready
+    import time
+    for _ in range(15):
+        try:
+            with socket.create_connection(("127.0.0.1", 3456), timeout=1):
+                console.print("[green]Meridian proxy ready[/green]")
+                return
+        except OSError:
+            time.sleep(1)
+    console.print("[yellow]Warning: Meridian did not start in time[/yellow]")
+
+
 def _make_provider(config: Config):
     """Create the appropriate LLM provider from config.
 
     Routing is driven by ``ProviderSpec.backend`` in the registry.
     """
+    _ensure_meridian(config)
     from nanobot.providers.base import GenerationSettings
     from nanobot.providers.registry import find_by_name
 
@@ -405,7 +449,10 @@ def _make_provider(config: Config):
             raise typer.Exit(1)
 
     # --- instantiation by backend ---
-    if backend == "openai_codex":
+    if backend == "claude_oauth":
+        from nanobot.providers.claude_oauth_provider import ClaudeOAuthProvider
+        provider = ClaudeOAuthProvider(default_model=model)
+    elif backend == "openai_codex":
         from nanobot.providers.openai_codex_provider import OpenAICodexProvider
         provider = OpenAICodexProvider(default_model=model)
     elif backend == "azure_openai":
@@ -1226,6 +1273,277 @@ def status():
 
 
 # ============================================================================
+# Claude Code Session Management
+# ============================================================================
+
+session_app = typer.Typer(help="Manage Claude Code sessions")
+app.add_typer(session_app, name="session")
+
+
+def _scan_claude_sessions() -> list[dict[str, Any]]:
+    """Scan ~/.claude/projects/ for all Claude Code sessions."""
+    import glob
+    import json as _json
+    from datetime import datetime
+
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.exists():
+        return []
+
+    sessions: list[dict[str, Any]] = []
+    for proj in os.listdir(projects_dir):
+        proj_path = projects_dir / proj
+        if not proj_path.is_dir():
+            continue
+        for f in glob.glob(str(proj_path / "*.jsonl")):
+            fp = Path(f)
+            session_id = fp.stem
+            lines = fp.read_text(encoding="utf-8", errors="ignore").splitlines()
+            mtime = fp.stat().st_mtime
+
+            # Extract first user message as summary
+            # Claude Code stores messages as {type: "user", message: {role, content}}
+            summary = ""
+            for line in lines[:20]:
+                try:
+                    msg = _json.loads(line)
+                    if msg.get("type") == "user":
+                        inner = msg.get("message", msg)
+                        content = inner.get("content", "")
+                        if isinstance(content, str):
+                            summary = content.replace("\n", " ").strip()[:100]
+                        elif isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    summary = c["text"].replace("\n", " ").strip()[:100]
+                                    break
+                        if summary:
+                            break
+                except Exception:
+                    pass
+
+            # Decode project path
+            project_name = proj.replace("-Users-zcc-", "~/").replace("-", "/")
+
+            sessions.append({
+                "id": session_id,
+                "project": project_name,
+                "project_raw": proj,
+                "messages": len(lines),
+                "modified": datetime.fromtimestamp(mtime),
+                "modified_str": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M"),
+                "summary": summary.replace("\n", " ").strip(),
+                "size_kb": fp.stat().st_size // 1024,
+                "path": str(fp),
+            })
+
+    sessions.sort(key=lambda x: x["modified"], reverse=True)
+    return sessions
+
+
+@session_app.command("list")
+def session_list(
+    project: str = typer.Option(None, "--project", "-p", help="Filter by project name (substring match)"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max sessions to show"),
+):
+    """List Claude Code sessions."""
+    from rich.table import Table
+
+    sessions = _scan_claude_sessions()
+    if project:
+        sessions = [s for s in sessions if project.lower() in s["project"].lower()]
+
+    if not sessions:
+        console.print("[yellow]No Claude Code sessions found.[/yellow]")
+        raise typer.Exit(0)
+
+    table = Table(title=f"Claude Code Sessions ({len(sessions)} total)")
+    table.add_column("#", style="dim", width=3)
+    table.add_column("Session ID", style="cyan", width=10)
+    table.add_column("Modified", width=16)
+    table.add_column("Msgs", justify="right", width=5)
+    table.add_column("Size", justify="right", width=7)
+    table.add_column("Project", style="green", max_width=35)
+    table.add_column("Summary", max_width=40)
+
+    for i, s in enumerate(sessions[:limit], 1):
+        table.add_row(
+            str(i),
+            s["id"][:8] + "…",
+            s["modified_str"],
+            str(s["messages"]),
+            f"{s['size_kb']}KB",
+            s["project"][-35:],
+            (s["summary"].replace("\n", " ")[:37] + "…") if len(s["summary"]) > 37 else s["summary"].replace("\n", " "),
+        )
+
+    console.print(table)
+
+
+@session_app.command("show")
+def session_show(
+    session_id: str = typer.Argument(..., help="Session ID (full or prefix)"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max messages to show"),
+    tail: bool = typer.Option(False, "--tail", "-t", help="Show last N messages instead of first"),
+):
+    """Show messages in a Claude Code session."""
+    import json as _json
+
+    sessions = _scan_claude_sessions()
+    match = [s for s in sessions if s["id"].startswith(session_id)]
+    if not match:
+        console.print(f"[red]No session found matching '{session_id}'[/red]")
+        raise typer.Exit(1)
+    if len(match) > 1:
+        console.print(f"[yellow]Multiple matches, using most recent: {match[0]['id'][:8]}[/yellow]")
+
+    s = match[0]
+    console.print(f"[bold]Session:[/bold] {s['id']}")
+    console.print(f"[bold]Project:[/bold] {s['project']}")
+    console.print(f"[bold]Modified:[/bold] {s['modified_str']}  [bold]Messages:[/bold] {s['messages']}  [bold]Size:[/bold] {s['size_kb']}KB\n")
+
+    lines = Path(s["path"]).read_text(encoding="utf-8", errors="ignore").splitlines()
+    if tail:
+        lines = lines[-limit:]
+    else:
+        lines = lines[:limit]
+
+    for line in lines:
+        try:
+            msg = _json.loads(line)
+            msg_type = msg.get("type", "?")
+            inner = msg.get("message", msg)
+            role = inner.get("role", msg_type)
+
+            if msg_type in ("permission-mode", "file-history-snapshot", "attachment"):
+                continue  # Skip metadata entries
+
+            if role == "user" or msg_type == "user":
+                style = "bold blue"
+                role = "user"
+            elif role == "assistant" or msg_type == "assistant":
+                style = "bold green"
+                role = "assistant"
+            else:
+                style = "dim"
+
+            content = inner.get("content", "")
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                parts = []
+                for c in content:
+                    if isinstance(c, dict):
+                        if c.get("type") == "text":
+                            parts.append(c["text"])
+                        elif c.get("type") == "tool_use":
+                            parts.append(f"[tool: {c.get('name', '?')}]")
+                        elif c.get("type") == "tool_result":
+                            parts.append("[tool_result]")
+                text = " ".join(parts)
+
+            preview = text.replace("\n", " ").strip()[:120]
+            if len(text) > 120:
+                preview += "…"
+            if preview:
+                console.print(f"[{style}]{role:>10}[/{style}]  {preview}")
+        except Exception:
+            pass
+
+
+@session_app.command("delete")
+def session_delete(
+    session_id: str = typer.Argument(..., help="Session ID (full or prefix)"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+):
+    """Delete a Claude Code session."""
+    import shutil
+
+    sessions = _scan_claude_sessions()
+    match = [s for s in sessions if s["id"].startswith(session_id)]
+    if not match:
+        console.print(f"[red]No session found matching '{session_id}'[/red]")
+        raise typer.Exit(1)
+
+    s = match[0]
+    console.print(f"Session: {s['id']}")
+    console.print(f"Project: {s['project']}")
+    console.print(f"Messages: {s['messages']}  Size: {s['size_kb']}KB  Modified: {s['modified_str']}")
+
+    if not force:
+        confirm = typer.confirm("Delete this session?")
+        if not confirm:
+            raise typer.Exit(0)
+
+    # Delete JSONL file
+    Path(s["path"]).unlink(missing_ok=True)
+    # Delete subagents directory if exists
+    subagents_dir = Path(s["path"]).parent / s["id"] / "subagents"
+    if subagents_dir.exists():
+        shutil.rmtree(subagents_dir, ignore_errors=True)
+    parent_dir = Path(s["path"]).parent / s["id"]
+    if parent_dir.exists():
+        shutil.rmtree(parent_dir, ignore_errors=True)
+
+    console.print(f"[green]✓ Session {s['id'][:8]}… deleted[/green]")
+
+
+@session_app.command("resume")
+def session_resume(
+    session_id: str = typer.Argument(..., help="Session ID (full or prefix)"),
+):
+    """Resume a Claude Code session in interactive mode."""
+    import subprocess
+
+    sessions = _scan_claude_sessions()
+    match = [s for s in sessions if s["id"].startswith(session_id)]
+    if not match:
+        console.print(f"[red]No session found matching '{session_id}'[/red]")
+        raise typer.Exit(1)
+
+    s = match[0]
+    console.print(f"[cyan]Resuming session {s['id'][:8]}… ({s['project']})[/cyan]")
+
+    # Launch claude CLI with resume flag
+    subprocess.run(["claude", "-r", s["id"]], cwd=Path.home())
+
+
+@session_app.command("clean")
+def session_clean(
+    days: int = typer.Option(30, "--days", "-d", help="Delete sessions older than N days"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+):
+    """Clean up old Claude Code sessions."""
+    import shutil
+    from datetime import datetime, timedelta
+
+    sessions = _scan_claude_sessions()
+    cutoff = datetime.now() - timedelta(days=days)
+    old = [s for s in sessions if s["modified"] < cutoff]
+
+    if not old:
+        console.print(f"[green]No sessions older than {days} days.[/green]")
+        raise typer.Exit(0)
+
+    total_kb = sum(s["size_kb"] for s in old)
+    console.print(f"Found [bold]{len(old)}[/bold] sessions older than {days} days ({total_kb}KB)")
+
+    if not force:
+        confirm = typer.confirm("Delete all?")
+        if not confirm:
+            raise typer.Exit(0)
+
+    for s in old:
+        Path(s["path"]).unlink(missing_ok=True)
+        sub_dir = Path(s["path"]).parent / s["id"]
+        if sub_dir.exists():
+            shutil.rmtree(sub_dir, ignore_errors=True)
+
+    console.print(f"[green]✓ Deleted {len(old)} sessions ({total_kb}KB freed)[/green]")
+
+
+# ============================================================================
 # OAuth Login
 # ============================================================================
 
@@ -1264,6 +1582,22 @@ def provider_login(
 
     console.print(f"{__logo__} OAuth Login - {spec.label}\n")
     handler()
+
+
+@_register_login("claude_oauth")
+def _login_claude_oauth() -> None:
+    try:
+        from nanobot.providers.claude_oauth_provider import login_claude_oauth
+
+        console.print("[cyan]Starting Claude OAuth login (browser will open)...[/cyan]\n")
+        token_data = login_claude_oauth(
+            print_fn=lambda s: console.print(s),
+            prompt_fn=lambda s: typer.prompt(s),
+        )
+        console.print("[green]✓ Authenticated with Claude OAuth (Max subscription)[/green]")
+    except Exception as e:
+        console.print(f"[red]Authentication error: {e}[/red]")
+        raise typer.Exit(1)
 
 
 @_register_login("openai_codex")
