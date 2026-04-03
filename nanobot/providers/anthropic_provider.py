@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import secrets
 import string
@@ -344,10 +345,131 @@ class AnthropicProvider(LLMProvider):
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _parse_raw_sse(raw: str) -> LLMResponse:
+        """Extract content from a raw SSE stream string.
+
+        Some proxies (e.g. meridian) return SSE-formatted data even for
+        non-streaming requests.  This parses text_delta, tool_use, and
+        thinking events to recover the actual assistant reply.
+        """
+        import json as _json
+
+        text_parts: list[str] = []
+        # Track tool_use blocks by index: {index: {"id": ..., "name": ..., "json_parts": [...]}}
+        tool_use_blocks: dict[int, dict[str, Any]] = {}
+        # Track thinking blocks by index: {index: {"thinking_parts": [...]}}
+        thinking_blocks_by_idx: dict[int, list[str]] = {}
+        finish_reason = "stop"
+
+        for line in raw.splitlines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:]
+            if payload.strip() == "[DONE]":
+                continue
+            try:
+                obj = _json.loads(payload)
+            except Exception:
+                continue
+
+            event_type = obj.get("type", "")
+            index = obj.get("index", 0)
+
+            if event_type == "content_block_start":
+                block = obj.get("content_block") or {}
+                btype = block.get("type")
+                if btype == "text" and block.get("text"):
+                    text_parts.append(block["text"])
+                elif btype == "tool_use":
+                    tool_use_blocks[index] = {
+                        "id": block.get("id", ""),
+                        "name": block.get("name", ""),
+                        "json_parts": [],
+                    }
+                elif btype == "thinking":
+                    thinking_blocks_by_idx[index] = []
+
+            elif event_type == "content_block_delta":
+                delta = obj.get("delta") or {}
+                dtype = delta.get("type")
+                if dtype == "text_delta":
+                    text_parts.append(delta.get("text", ""))
+                elif dtype == "input_json_delta":
+                    if index in tool_use_blocks:
+                        tool_use_blocks[index]["json_parts"].append(
+                            delta.get("partial_json", "")
+                        )
+                elif dtype == "thinking_delta":
+                    if index in thinking_blocks_by_idx:
+                        thinking_blocks_by_idx[index].append(
+                            delta.get("thinking", "")
+                        )
+
+            elif event_type == "message_delta":
+                delta = obj.get("delta") or {}
+                sr = delta.get("stop_reason")
+                if sr:
+                    stop_map = {"tool_use": "tool_calls", "end_turn": "stop", "max_tokens": "length"}
+                    finish_reason = stop_map.get(sr, sr)
+
+        # Build tool_calls list
+        tool_calls: list[ToolCallRequest] = []
+        for _idx in sorted(tool_use_blocks):
+            info = tool_use_blocks[_idx]
+            json_str = "".join(info["json_parts"])
+            try:
+                arguments = _json.loads(json_str) if json_str else {}
+            except Exception:
+                arguments = {}
+            tool_calls.append(ToolCallRequest(
+                id=info["id"],
+                name=info["name"],
+                arguments=arguments if isinstance(arguments, dict) else {},
+            ))
+
+        # Build thinking blocks
+        thinking_blocks: list[dict[str, Any]] = []
+        for _idx in sorted(thinking_blocks_by_idx):
+            thinking_text = "".join(thinking_blocks_by_idx[_idx])
+            if thinking_text:
+                thinking_blocks.append({
+                    "type": "thinking",
+                    "thinking": thinking_text,
+                    "signature": "",
+                })
+
+        content_str = "".join(text_parts)
+
+        # If we parsed nothing at all, fall back to raw
+        if not content_str and not tool_calls and not thinking_blocks:
+            logger.warning(
+                "Proxy returned unparseable SSE response ({} chars), first 300: {}",
+                len(raw), raw[:300],
+            )
+            content_str = raw
+            if len(content_str) > 500:
+                content_str = "(Proxy returned unparseable response)"
+                finish_reason = "error"
+
+        return LLMResponse(
+            content=content_str or None,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            thinking_blocks=thinking_blocks or None,
+        )
+
+    @staticmethod
     def _parse_response(response: Any) -> LLMResponse:
         content_parts: list[str] = []
         tool_calls: list[ToolCallRequest] = []
         thinking_blocks: list[dict[str, Any]] = []
+
+        # Defensive: some proxies (e.g. meridian) return a raw SSE stream
+        # string or plain string instead of a Message object.
+        if isinstance(response, str):
+            return AnthropicProvider._parse_raw_sse(response)
+        if not hasattr(response, "content"):
+            return LLMResponse(content=str(response), finish_reason="stop")
 
         for block in response.content:
             if block.type == "text":
@@ -406,11 +528,31 @@ class AnthropicProvider(LLMProvider):
             messages, tools, model, max_tokens, temperature,
             reasoning_effort, tool_choice,
         )
-        try:
-            response = await self._client.messages.create(**kwargs)
-            return self._parse_response(response)
-        except Exception as e:
-            return LLMResponse(content=f"Error calling LLM: {e}", finish_reason="error")
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                response = await self._client.messages.create(**kwargs)
+                if isinstance(response, str):
+                    logger.debug("Proxy returned raw string for non-streaming call, using as content")
+                result = self._parse_response(response)
+                # Retry on unparseable proxy response
+                if result.content == "(Proxy returned unparseable response)" and attempt < max_retries:
+                    logger.warning(
+                        "Retrying LLM call due to unparseable proxy response (attempt {}/{})",
+                        attempt + 1, max_retries,
+                    )
+                    await asyncio.sleep(1.0 * (attempt + 1))
+                    continue
+                return result
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.warning(
+                        "LLM call failed (attempt {}/{}): {}", attempt + 1, max_retries, e,
+                    )
+                    await asyncio.sleep(1.0 * (attempt + 1))
+                    continue
+                return LLMResponse(content=f"Error calling LLM: {e}", finish_reason="error")
+        return LLMResponse(content="Error: max retries exceeded", finish_reason="error")
 
     async def chat_stream(
         self,
