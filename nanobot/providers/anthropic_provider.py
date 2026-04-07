@@ -624,7 +624,10 @@ class AnthropicProvider(LLMProvider):
             try:
                 response = await self._client.messages.create(**kwargs)
                 if isinstance(response, str):
-                    logger.debug("Proxy returned raw string for non-streaming call, using as content")
+                    logger.debug(
+                        "Proxy returned raw string ({} chars), first 1000: {}",
+                        len(response), response[:1000],
+                    )
                 result = self._parse_response(response)
                 # Retry on unparseable proxy response
                 if result.content == "(Proxy returned unparseable response)" and attempt < max_retries:
