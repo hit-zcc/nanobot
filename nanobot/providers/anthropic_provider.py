@@ -545,8 +545,18 @@ class AnthropicProvider(LLMProvider):
         # Defensive: some proxies (e.g. meridian) return a raw string
         # instead of a Message object — try JSON first, then SSE.
         if isinstance(response, str):
+            logger.debug(
+                "Parsing raw string response ({} chars), first 500: {}",
+                len(response), response[:500],
+            )
             json_result = AnthropicProvider._parse_raw_json(response)
             if json_result is not None:
+                logger.debug(
+                    "Parsed as JSON: has_tool_calls={}, tool_names={}, finish={}",
+                    json_result.has_tool_calls,
+                    [tc.name for tc in json_result.tool_calls] if json_result.tool_calls else [],
+                    json_result.finish_reason,
+                )
                 return json_result
             return AnthropicProvider._parse_raw_sse(response)
         if not hasattr(response, "content"):
