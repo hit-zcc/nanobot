@@ -2,12 +2,15 @@
 
 import asyncio
 import json
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
+
+from nanobot.providers.llm_logger import log_call as _log_llm_call
 
 
 @dataclass
@@ -92,6 +95,7 @@ class LLMProvider(ABC):
         "connection",
         "server error",
         "temporarily unavailable",
+        "unparseable",
     )
 
     _SENTINEL = object()
@@ -289,17 +293,23 @@ class LLMProvider(ABC):
             on_content_delta=on_content_delta,
         )
 
+        _t0 = time.monotonic()
+
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
             response = await self._safe_chat_stream(**kw)
 
             if response.finish_reason != "error":
+                self._emit_log(kw, response, _t0, stream=True)
                 return response
 
             if not self._is_transient_error(response.content):
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning("Non-transient LLM error with image content, retrying without images")
-                    return await self._safe_chat_stream(**{**kw, "messages": stripped})
+                    response = await self._safe_chat_stream(**{**kw, "messages": stripped})
+                    self._emit_log(kw, response, _t0, stream=True)
+                    return response
+                self._emit_log(kw, response, _t0, stream=True)
                 return response
 
             logger.warning(
@@ -309,7 +319,9 @@ class LLMProvider(ABC):
             )
             await asyncio.sleep(delay)
 
-        return await self._safe_chat_stream(**kw)
+        response = await self._safe_chat_stream(**kw)
+        self._emit_log(kw, response, _t0, stream=True)
+        return response
 
     async def chat_with_retry(
         self,
@@ -340,17 +352,23 @@ class LLMProvider(ABC):
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
         )
 
+        _t0 = time.monotonic()
+
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
             response = await self._safe_chat(**kw)
 
             if response.finish_reason != "error":
+                self._emit_log(kw, response, _t0, stream=False)
                 return response
 
             if not self._is_transient_error(response.content):
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning("Non-transient LLM error with image content, retrying without images")
-                    return await self._safe_chat(**{**kw, "messages": stripped})
+                    response = await self._safe_chat(**{**kw, "messages": stripped})
+                    self._emit_log(kw, response, _t0, stream=False)
+                    return response
+                self._emit_log(kw, response, _t0, stream=False)
                 return response
 
             logger.warning(
@@ -360,7 +378,31 @@ class LLMProvider(ABC):
             )
             await asyncio.sleep(delay)
 
-        return await self._safe_chat(**kw)
+        response = await self._safe_chat(**kw)
+        self._emit_log(kw, response, _t0, stream=False)
+        return response
+
+    @staticmethod
+    def _emit_log(kw: dict[str, Any], response: "LLMResponse", t0: float, *, stream: bool) -> None:
+        """Fire-and-forget logging of an LLM call."""
+        import sys
+        print(f"[llm_logger] _emit_log called, model={kw.get('model')}", file=sys.stderr, flush=True)
+        try:
+            _log_llm_call(
+                model=kw.get("model"),
+                messages=kw.get("messages"),
+                tools=kw.get("tools"),
+                temperature=kw.get("temperature"),
+                max_tokens=kw.get("max_tokens"),
+                reasoning_effort=kw.get("reasoning_effort"),
+                tool_choice=kw.get("tool_choice"),
+                response=response,
+                duration_ms=(time.monotonic() - t0) * 1000,
+                stream=stream,
+            )
+        except Exception:
+            import sys, traceback
+            print(f"[llm_logger] emit error: {traceback.format_exc()}", file=sys.stderr)
 
     @abstractmethod
     def get_default_model(self) -> str:

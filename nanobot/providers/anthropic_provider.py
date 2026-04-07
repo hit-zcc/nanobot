@@ -345,6 +345,78 @@ class AnthropicProvider(LLMProvider):
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _parse_raw_json(raw: str) -> LLMResponse | None:
+        """Try to parse a raw JSON string as an Anthropic Messages API response.
+
+        Some proxies return the response as a plain JSON string instead of
+        a Message object.  This handles that case, extracting text, tool_use,
+        and thinking blocks from the JSON ``content`` array.
+        Returns *None* if the string is not a valid JSON API response.
+        """
+        import json as _json
+
+        raw_stripped = raw.strip()
+        if not raw_stripped.startswith("{"):
+            return None
+        try:
+            obj = _json.loads(raw_stripped)
+        except Exception:
+            return None
+        if not isinstance(obj, dict) or "content" not in obj:
+            return None
+
+        content_parts: list[str] = []
+        tool_calls: list[ToolCallRequest] = []
+        thinking_blocks: list[dict[str, Any]] = []
+
+        for block in obj["content"]:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                content_parts.append(block.get("text", ""))
+            elif btype == "tool_use":
+                inp = block.get("input", {})
+                tool_calls.append(ToolCallRequest(
+                    id=block.get("id", "") or _gen_tool_id(),
+                    name=block.get("name", ""),
+                    arguments=inp if isinstance(inp, dict) else {},
+                ))
+            elif btype == "thinking":
+                thinking_blocks.append({
+                    "type": "thinking",
+                    "thinking": block.get("thinking", ""),
+                    "signature": block.get("signature", ""),
+                })
+
+        stop_reason = obj.get("stop_reason", "")
+        stop_map = {"tool_use": "tool_calls", "end_turn": "stop", "max_tokens": "length"}
+        finish_reason = stop_map.get(stop_reason, stop_reason or "stop")
+
+        usage: dict[str, int] = {}
+        usage_obj = obj.get("usage")
+        if isinstance(usage_obj, dict):
+            inp_tok = usage_obj.get("input_tokens", 0)
+            out_tok = usage_obj.get("output_tokens", 0)
+            usage = {
+                "prompt_tokens": inp_tok,
+                "completion_tokens": out_tok,
+                "total_tokens": inp_tok + out_tok,
+            }
+            for attr in ("cache_creation_input_tokens", "cache_read_input_tokens"):
+                val = usage_obj.get(attr, 0)
+                if val:
+                    usage[attr] = val
+
+        return LLMResponse(
+            content="".join(content_parts) or None,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            usage=usage,
+            thinking_blocks=thinking_blocks or None,
+        )
+
+    @staticmethod
     def _parse_raw_sse(raw: str) -> LLMResponse:
         """Extract content from a raw SSE stream string.
 
@@ -440,16 +512,17 @@ class AnthropicProvider(LLMProvider):
 
         content_str = "".join(text_parts)
 
-        # If we parsed nothing at all, fall back to raw
+        # If we parsed nothing at all, the response is not a valid SSE stream.
+        # A real Anthropic response is always valid JSON or SSE — anything else
+        # is a proxy artifact (e.g. "Forwarding to client for execution") and
+        # should be retried rather than passed through as LLM content.
         if not content_str and not tool_calls and not thinking_blocks:
             logger.warning(
                 "Proxy returned unparseable SSE response ({} chars), first 300: {}",
                 len(raw), raw[:300],
             )
-            content_str = raw
-            if len(content_str) > 500:
-                content_str = "(Proxy returned unparseable response)"
-                finish_reason = "error"
+            content_str = "(Proxy returned unparseable response)"
+            finish_reason = "error"
 
         return LLMResponse(
             content=content_str or None,
@@ -464,9 +537,12 @@ class AnthropicProvider(LLMProvider):
         tool_calls: list[ToolCallRequest] = []
         thinking_blocks: list[dict[str, Any]] = []
 
-        # Defensive: some proxies (e.g. meridian) return a raw SSE stream
-        # string or plain string instead of a Message object.
+        # Defensive: some proxies (e.g. meridian) return a raw string
+        # instead of a Message object — try JSON first, then SSE.
         if isinstance(response, str):
+            json_result = AnthropicProvider._parse_raw_json(response)
+            if json_result is not None:
+                return json_result
             return AnthropicProvider._parse_raw_sse(response)
         if not hasattr(response, "content"):
             return LLMResponse(content=str(response), finish_reason="stop")

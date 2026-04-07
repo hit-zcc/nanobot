@@ -15,11 +15,15 @@ class MessageTool(Tool):
         default_channel: str = "",
         default_chat_id: str = "",
         default_message_id: str | None = None,
+        fixed_channel: str | None = None,
+        fixed_chat_id: str | None = None,
     ):
         self._send_callback = send_callback
         self._default_channel = default_channel
         self._default_chat_id = default_chat_id
         self._default_message_id = default_message_id
+        self._fixed_channel = fixed_channel
+        self._fixed_chat_id = fixed_chat_id
         self._sent_in_turn: bool = False
 
     def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
@@ -84,8 +88,14 @@ class MessageTool(Tool):
         media: list[str] | None = None,
         **kwargs: Any
     ) -> str:
-        channel = channel or self._default_channel
-        chat_id = chat_id or self._default_chat_id
+        if self._fixed_channel is not None:
+            channel = self._fixed_channel
+        else:
+            channel = channel or self._default_channel
+        if self._fixed_chat_id is not None:
+            chat_id = self._fixed_chat_id
+        else:
+            chat_id = chat_id or self._default_chat_id
         # Only inherit default message_id when targeting the same channel+chat.
         # Cross-chat sends must not carry the original message_id, because
         # some channels (e.g. Feishu) use it to determine the target
