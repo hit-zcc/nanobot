@@ -165,13 +165,22 @@ class MemoryStore:
                 )
                 return self._fail_or_raw_archive(messages)
 
-            args = _normalize_save_memory_args(response.tool_calls[0].arguments)
+            raw_args = response.tool_calls[0].arguments
+            args = _normalize_save_memory_args(raw_args)
             if args is None:
-                logger.warning("Memory consolidation: unexpected save_memory arguments")
+                logger.warning(
+                    "Memory consolidation: unexpected save_memory arguments: {}",
+                    repr(raw_args)[:300],
+                )
                 return self._fail_or_raw_archive(messages)
 
             if "history_entry" not in args or "memory_update" not in args:
-                logger.warning("Memory consolidation: save_memory payload missing required fields")
+                logger.warning(
+                    "Memory consolidation: save_memory payload missing required fields, "
+                    "got keys={}, raw_preview={}",
+                    list(args.keys()),
+                    repr(raw_args)[:300],
+                )
                 return self._fail_or_raw_archive(messages)
 
             entry = args["history_entry"]
@@ -357,7 +366,13 @@ class MemoryConsolidator:
                     len(chunk),
                 )
                 if not await self.consolidate_messages(chunk):
-                    return
+                    # Consolidation failed — raw-archive and advance anyway
+                    # to avoid re-trying the same chunk on every message.
+                    logger.warning(
+                        "Token consolidation failed for {}, falling back to raw archive",
+                        session.key,
+                    )
+                    self.store._raw_archive(chunk)
                 session.last_consolidated = end_idx
                 self.sessions.save(session)
 
