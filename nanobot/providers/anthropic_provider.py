@@ -377,6 +377,11 @@ class AnthropicProvider(LLMProvider):
                 content_parts.append(block.get("text", ""))
             elif btype == "tool_use":
                 inp = block.get("input", {})
+                if isinstance(inp, str):
+                    try:
+                        inp = _json.loads(inp)
+                    except Exception:
+                        inp = {}
                 tool_calls.append(ToolCallRequest(
                     id=block.get("id", "") or _gen_tool_id(),
                     name=block.get("name", ""),
