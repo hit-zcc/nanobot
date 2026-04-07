@@ -531,7 +531,7 @@ class AgentLoop:
         try:
             await asyncio.wait_for(
                 self.memory_consolidator.maybe_consolidate_by_tokens(session),
-                timeout=30,
+                timeout=120,
             )
         except asyncio.TimeoutError:
             logger.warning("Pre-message token consolidation timed out for {}", key)
