@@ -44,10 +44,31 @@ class AgentDefaults(Base):
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
 
 
+class AgentConfig(Base):
+    """Single agent configuration for multi-agent mode."""
+
+    id: str  # unique agent identifier
+    name: str = ""  # display name
+    workspace: str = ""  # independent workspace path (overrides defaults.workspace)
+    agent_dir: str = ""  # directory containing SOUL.md, AGENTS.md, USER.md, TOOLS.md
+    model: str | None = None  # override default model
+    provider: str | None = None  # override default provider
+
+
+class BindingConfig(Base):
+    """Route inbound messages to a specific agent. First match wins."""
+
+    agent_id: str
+    channel: str | None = None  # e.g. "feishu", "telegram"
+    chat_id: str | None = None  # specific chat/group id
+
+
 class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    agents: list[AgentConfig] = Field(default_factory=list, alias="list")
+    bindings: list[BindingConfig] = Field(default_factory=list)
 
 
 class ProviderConfig(Base):

@@ -35,12 +35,19 @@ class ChannelManager:
         self._init_channels()
 
     def _init_channels(self) -> None:
-        """Initialize channels discovered via pkgutil scan + entry_points plugins."""
+        """Initialize channels discovered via pkgutil scan + entry_points plugins.
+
+        Supports multi-instance channels via dotted config keys.
+        For example, ``feishu.jarvis`` creates a second FeishuChannel
+        instance whose ``name`` is ``"feishu.jarvis"`` (used for routing).
+        """
         from nanobot.channels.registry import discover_all
 
         groq_key = self.config.providers.groq.api_key
+        all_channels = discover_all()
 
-        for name, cls in discover_all().items():
+        # --- exact-match channels (existing behaviour) ---
+        for name, cls in all_channels.items():
             section = getattr(self.config.channels, name, None)
             if section is None:
                 continue
@@ -58,6 +65,31 @@ class ChannelManager:
                 logger.info("{} channel enabled", cls.display_name)
             except Exception as e:
                 logger.warning("{} channel not available: {}", name, e)
+
+        # --- multi-instance channels: "type.instance" in extra fields ---
+        extra = self.config.channels.model_extra or {}
+        for key, section in extra.items():
+            if "." not in key:
+                continue
+            channel_type = key.split(".", 1)[0]
+            cls = all_channels.get(channel_type)
+            if cls is None:
+                continue
+            enabled = (
+                section.get("enabled", False)
+                if isinstance(section, dict)
+                else getattr(section, "enabled", False)
+            )
+            if not enabled:
+                continue
+            try:
+                channel = cls(section, self.bus)
+                channel.name = key  # override for routing
+                channel.transcription_api_key = groq_key
+                self.channels[key] = channel
+                logger.info("{} channel enabled (instance: {})", cls.display_name, key)
+            except Exception as e:
+                logger.warning("{} channel instance '{}' not available: {}", channel_type, key, e)
 
         self._validate_allow_from()
 

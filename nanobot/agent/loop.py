@@ -174,6 +174,8 @@ class AgentLoop:
         channels_config: ChannelsConfig | None = None,
         timezone: str | None = None,
         hooks: list[AgentHook] | None = None,
+        agent_dir: Path | None = None,
+        agent_id: str | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -189,11 +191,12 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.agent_id = agent_id
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
-        self.context = ContextBuilder(workspace, timezone=timezone)
+        self.context = ContextBuilder(workspace, timezone=timezone, agent_dir=agent_dir)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)
@@ -528,13 +531,11 @@ class AgentLoop:
         if result := await self.commands.dispatch(ctx):
             return result
 
-        try:
-            await asyncio.wait_for(
-                self.memory_consolidator.maybe_consolidate_by_tokens(session),
-                timeout=120,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("Pre-message token consolidation timed out for {}", key)
+        # Fast synchronous trim to stay within context window, then schedule
+        # the full LLM-based consolidation in the background so the user isn't
+        # blocked waiting for a summarisation call.
+        self.memory_consolidator.trim_if_over_budget(session)
+        self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):

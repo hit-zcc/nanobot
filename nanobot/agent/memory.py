@@ -312,6 +312,39 @@ class MemoryConsolidator:
                 return True
         return True
 
+    def trim_if_over_budget(self, session: Session) -> None:
+        """Fast, synchronous trim: drop oldest messages via raw archive (no LLM).
+
+        Ensures the prompt fits within the context window budget before sending
+        to the LLM. Unlike ``maybe_consolidate_by_tokens`` this never calls an
+        LLM so it completes instantly.
+        """
+        if not session.messages or self.context_window_tokens <= 0:
+            return
+
+        budget = self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
+        estimated, source = self.estimate_session_prompt_tokens(session)
+        if estimated <= 0 or estimated < budget:
+            return
+
+        target = budget // 2
+        boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
+        if boundary is None:
+            return
+
+        end_idx = boundary[0]
+        chunk = session.messages[session.last_consolidated:end_idx]
+        if not chunk:
+            return
+
+        logger.info(
+            "Fast trim for {}: {}/{} via {}, dropping {} msgs",
+            session.key, estimated, self.context_window_tokens, source, len(chunk),
+        )
+        self.store._raw_archive(chunk)
+        session.last_consolidated = end_idx
+        self.sessions.save(session)
+
     async def maybe_consolidate_by_tokens(self, session: Session) -> None:
         """Loop: archive old messages until prompt fits within safe budget.
 
