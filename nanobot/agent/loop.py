@@ -109,6 +109,15 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
+        # Coalesce bursts of messages in the same session into a single turn so
+        # e.g. an image followed quickly by a question gets one combined reply
+        # instead of two. NANOBOT_COALESCE_WINDOW seconds of quiet ends a burst
+        # (<=0 disables coalescing).
+        self._coalesce_window: float = float(
+            os.environ.get("NANOBOT_COALESCE_WINDOW", "3.0")
+        )
+        self._inbound_buffer: dict[str, list[InboundMessage]] = {}
+        self._debounce_tasks: dict[str, asyncio.Task] = {}
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
@@ -301,9 +310,63 @@ class AgentLoop:
                 if result:
                     await self.bus.publish_outbound(result)
                 continue
-            task = asyncio.create_task(self._dispatch(msg))
-            self._active_tasks.setdefault(msg.session_key, []).append(task)
-            task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+            if self._coalesce_window > 0:
+                self._buffer_inbound(msg)
+            else:
+                self._spawn_dispatch(msg)
+
+    def _spawn_dispatch(self, msg: InboundMessage) -> None:
+        """Dispatch a (possibly merged) message as a tracked, cancellable task."""
+        task = asyncio.create_task(self._dispatch(msg))
+        self._active_tasks.setdefault(msg.session_key, []).append(task)
+        task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+
+    def _buffer_inbound(self, msg: InboundMessage) -> None:
+        """Buffer a message and (re)start the per-session coalesce timer.
+
+        Each new message in the same session slides the window, so a burst is
+        only flushed once `self._coalesce_window` seconds of quiet have passed.
+        """
+        key = msg.session_key
+        self._inbound_buffer.setdefault(key, []).append(msg)
+        if old := self._debounce_tasks.get(key):
+            old.cancel()
+        self._debounce_tasks[key] = asyncio.create_task(self._flush_after_quiet(key))
+
+    async def _flush_after_quiet(self, key: str) -> None:
+        """Wait for the quiet window, then dispatch the buffered burst as one turn."""
+        try:
+            await asyncio.sleep(self._coalesce_window)
+        except asyncio.CancelledError:
+            return  # superseded by a newer message; that timer will flush
+        self._debounce_tasks.pop(key, None)
+        batch = self._inbound_buffer.pop(key, [])
+        if not batch:
+            return
+        merged = batch[0] if len(batch) == 1 else self._merge_inbound(batch)
+        self._spawn_dispatch(merged)
+
+    @staticmethod
+    def _merge_inbound(batch: list[InboundMessage]) -> InboundMessage:
+        """Merge a burst of messages into one: text joined, media concatenated.
+
+        The last message supplies channel/chat/sender/metadata so reactions and
+        replies target the most recent message of the burst.
+        """
+        last = batch[-1]
+        contents = [m.content.strip() for m in batch if m.content and m.content.strip()]
+        media: list[str] = []
+        for m in batch:
+            media.extend(m.media)
+        return InboundMessage(
+            channel=last.channel,
+            sender_id=last.sender_id,
+            chat_id=last.chat_id,
+            content="\n".join(contents),
+            media=media,
+            metadata=last.metadata,
+            session_key_override=last.session_key_override,
+        )
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
@@ -384,6 +447,10 @@ class AgentLoop:
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
+        for task in self._debounce_tasks.values():
+            task.cancel()
+        self._debounce_tasks.clear()
+        self._inbound_buffer.clear()
         logger.info("Agent loop stopping")
 
     async def _process_message(
