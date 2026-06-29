@@ -322,6 +322,15 @@ class FeishuChannel(BaseChannel):
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
+        # Staleness guard: drop messages created before this channel started
+        # (restart replays) or older than the threshold (in-process redelivery).
+        # Feishu's at-least-once delivery can re-push old events with a fresh
+        # message_id, which message_id dedup alone cannot catch.
+        # NANOBOT_FEISHU_STALE_SECONDS=0 disables the age check.
+        self._start_time_ms: int = int(time.time() * 1000)
+        self._stale_threshold_ms: int = int(
+            float(os.environ.get("NANOBOT_FEISHU_STALE_SECONDS", "120")) * 1000
+        )
 
     @staticmethod
     def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
@@ -1242,6 +1251,27 @@ class FeishuChannel(BaseChannel):
             message_id = message.message_id
             if message_id in self._processed_message_ids:
                 return
+
+            # Staleness guard — drop replayed/old messages that dedup-by-id can't
+            # catch (Feishu can re-push an old message as a new event after a
+            # reconnect or process restart, with a fresh message_id).
+            create_time_ms = int(message.create_time) if getattr(message, "create_time", None) else 0
+            if create_time_ms:
+                if create_time_ms < self._start_time_ms:
+                    logger.warning(
+                        "Feishu: dropping pre-startup message {} (created {}s before channel start)",
+                        message_id, (self._start_time_ms - create_time_ms) // 1000,
+                    )
+                    return
+                if self._stale_threshold_ms > 0:
+                    age_ms = int(time.time() * 1000) - create_time_ms
+                    if age_ms > self._stale_threshold_ms:
+                        logger.warning(
+                            "Feishu: dropping stale message {} (age {}s > {}s)",
+                            message_id, age_ms // 1000, self._stale_threshold_ms // 1000,
+                        )
+                        return
+
             self._processed_message_ids[message_id] = None
 
             # Trim cache
