@@ -25,6 +25,30 @@ import importlib.util
 
 FEISHU_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 
+
+class _ThreadLocalLoopProxy:
+    """Thread-local proxy for asyncio event loops.
+
+    Replaces lark_oapi.ws.client's module-level ``loop`` variable so that
+    multiple Feishu channel threads each get their own event loop without
+    overwriting each other.
+    """
+
+    _local = threading.local()
+
+    def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._local.loop = loop
+
+    def _get_loop(self) -> asyncio.AbstractEventLoop:
+        loop = getattr(self._local, "loop", None)
+        if loop is None:
+            raise RuntimeError("No event loop set for this thread")
+        return loop
+
+    def __getattr__(self, name: str):
+        return getattr(self._get_loop(), name)
+
+
 # Message type display mapping
 MSG_TYPE_MAP = {
     "image": "[image]",
@@ -357,13 +381,24 @@ class FeishuChannel(BaseChannel):
         # module-level `loop = asyncio.get_event_loop()` picks up an idle loop
         # instead of the already-running main asyncio loop, which would cause
         # "This event loop is already running" errors.
+        #
+        # When multiple Feishu channels run in the same process, each thread
+        # needs its own event loop.  We install a thread-local proxy object as
+        # the module-level ``loop`` so that every thread transparently gets its
+        # own loop without overwriting the others.
         def run_ws():
             import time
             import lark_oapi.ws.client as _lark_ws_client
+
             ws_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(ws_loop)
-            # Patch the module-level loop used by lark's ws Client.start()
-            _lark_ws_client.loop = ws_loop
+
+            # Install a thread-local proxy (once) so multiple Feishu channels
+            # in the same process don't overwrite each other's event loop.
+            if not isinstance(_lark_ws_client.loop, _ThreadLocalLoopProxy):
+                _lark_ws_client.loop = _ThreadLocalLoopProxy()
+            _lark_ws_client.loop.set_loop(ws_loop)
+
             try:
                 while self._running:
                     try:

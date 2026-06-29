@@ -184,6 +184,16 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
 
 
     # === Standard providers (matched by model-name keywords) ===============
+    # Claude OAuth: uses a Claude Max/Pro subscription via OAuth PKCE (no API key)
+    ProviderSpec(
+        name="claude_oauth",
+        keywords=("claude-oauth", "claude_oauth"),
+        env_key="",
+        display_name="Claude OAuth",
+        backend="claude_oauth",
+        is_oauth=True,
+        supports_prompt_caching=True,
+    ),
     # Anthropic: native Anthropic SDK
     ProviderSpec(
         name="anthropic",

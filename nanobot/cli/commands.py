@@ -405,7 +405,18 @@ def _make_provider(config: Config):
             raise typer.Exit(1)
 
     # --- instantiation by backend ---
-    if backend == "openai_codex":
+    if backend == "claude_oauth":
+        from nanobot.providers.claude_oauth_provider import ClaudeOAuthProvider, _load_token
+        if _load_token() is None:
+            console.print("[red]Error: Claude OAuth (subscription) not logged in.[/red]")
+            console.print("Run: [bold]nanobot provider login claude-oauth[/bold]")
+            console.print(
+                "Or switch to an API key: set model to 'anthropic/claude-opus-4-5' "
+                "and ANTHROPIC_API_KEY (or providers.anthropic.apiKey)."
+            )
+            raise typer.Exit(1)
+        provider = ClaudeOAuthProvider(default_model=model)
+    elif backend == "openai_codex":
         from nanobot.providers.openai_codex_provider import OpenAICodexProvider
         provider = OpenAICodexProvider(default_model=model)
     elif backend == "azure_openai":
@@ -1224,6 +1235,22 @@ def _login_github_copilot() -> None:
     try:
         asyncio.run(_trigger())
         console.print("[green]✓ Authenticated with GitHub Copilot[/green]")
+    except Exception as e:
+        console.print(f"[red]Authentication error: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@_register_login("claude_oauth")
+def _login_claude_oauth() -> None:
+    try:
+        from nanobot.providers.claude_oauth_provider import login_claude_oauth
+
+        console.print("[cyan]Starting Claude OAuth login (browser will open)...[/cyan]\n")
+        login_claude_oauth(
+            print_fn=lambda s: console.print(s),
+            prompt_fn=lambda s: typer.prompt(s),
+        )
+        console.print("[green]✓ Authenticated with Claude OAuth (Max/Pro subscription)[/green]")
     except Exception as e:
         console.print(f"[red]Authentication error: {e}[/red]")
         raise typer.Exit(1)

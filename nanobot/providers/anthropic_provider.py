@@ -284,6 +284,40 @@ class AnthropicProvider(LLMProvider):
         return system, new_msgs, new_tools
 
     # ------------------------------------------------------------------
+    # System-prefix hook (overridden by the Claude OAuth subclass)
+    # ------------------------------------------------------------------
+
+    def _system_prefix(self) -> str | None:
+        """Subclasses override to force a required first system block.
+
+        Used by the Claude OAuth path: Pro/Max OAuth tokens are only accepted
+        by ``api.anthropic.com`` when the first system block is exactly the
+        Claude Code identity string. Default ``None`` leaves API-key paths
+        untouched.
+        """
+        return None
+
+    @staticmethod
+    def _prepend_system_prefix(
+        system: str | list[dict[str, Any]],
+        prefix: str,
+    ) -> list[dict[str, Any]]:
+        """Return *system* as a block list whose first block is exactly *prefix*.
+
+        Idempotent: if the first block already carries *prefix*, the input is
+        returned unchanged so retries don't stack duplicate prefixes.
+        """
+        prefix_block = {"type": "text", "text": prefix}
+        if not system:
+            return [prefix_block]
+        if isinstance(system, str):
+            return [prefix_block, {"type": "text", "text": system}]
+        first = system[0]
+        if isinstance(first, dict) and first.get("type") == "text" and first.get("text") == prefix:
+            return list(system)
+        return [prefix_block, *system]
+
+    # ------------------------------------------------------------------
     # Build API kwargs
     # ------------------------------------------------------------------
 
@@ -301,6 +335,10 @@ class AnthropicProvider(LLMProvider):
         model_name = self._strip_prefix(model or self.default_model)
         system, anthropic_msgs = self._convert_messages(self._sanitize_empty_content(messages))
         anthropic_tools = self._convert_tools(tools)
+
+        prefix = self._system_prefix()
+        if prefix:
+            system = self._prepend_system_prefix(system, prefix)
 
         if supports_caching:
             system, anthropic_msgs, anthropic_tools = self._apply_cache_control(
