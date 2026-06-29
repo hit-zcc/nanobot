@@ -287,6 +287,17 @@ class AnthropicProvider(LLMProvider):
     # System-prefix hook (overridden by the Claude OAuth subclass)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _supports_temperature(model_name: str) -> bool:
+        """Newer Claude models deprecate the ``temperature`` param.
+
+        Covers the Claude 5-class models (Fable 5, Mythos 5) as well as the
+        Opus 4.8 generation (``claude-opus-4-8``), which all reject
+        ``temperature`` with a 400 ``invalid_request_error``.
+        """
+        m = model_name.lower()
+        return not ("fable" in m or "mythos" in m or "opus-4-8" in m)
+
     def _system_prefix(self) -> str | None:
         """Subclasses override to force a required first system block.
 
@@ -357,13 +368,15 @@ class AnthropicProvider(LLMProvider):
         if system:
             kwargs["system"] = system
 
+        supports_temperature = self._supports_temperature(model_name)
         if thinking_enabled:
             budget_map = {"low": 1024, "medium": 4096, "high": max(8192, max_tokens)}
             budget = budget_map.get(reasoning_effort.lower(), 4096)  # type: ignore[union-attr]
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             kwargs["max_tokens"] = max(max_tokens, budget + 4096)
-            kwargs["temperature"] = 1.0
-        else:
+            if supports_temperature:
+                kwargs["temperature"] = 1.0
+        elif supports_temperature:
             kwargs["temperature"] = temperature
 
         if anthropic_tools:
