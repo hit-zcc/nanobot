@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import weakref
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +24,9 @@ _SAVE_MEMORY_TOOL = [
         "type": "function",
         "function": {
             "name": "save_memory",
-            "description": "Save the memory consolidation result to persistent storage.",
+            "description": "Save the memory consolidation result to persistent storage. "
+            "Update long-term memory INCREMENTALLY: only report newly learned facts and "
+            "facts that became obsolete. Do NOT echo the whole memory back.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -32,13 +35,21 @@ _SAVE_MEMORY_TOOL = [
                         "description": "A paragraph summarizing key events/decisions/topics. "
                         "Start with [YYYY-MM-DD HH:MM]. Include detail useful for grep search.",
                     },
-                    "memory_update": {
+                    "new_facts": {
                         "type": "string",
-                        "description": "Full updated long-term memory as markdown. Include all existing "
-                        "facts plus new ones. Return unchanged if nothing new.",
+                        "description": "Durable new facts to ADD to long-term memory, as markdown. "
+                        "Include only facts NOT already present in the current memory shown to you. "
+                        "Use an empty string when nothing new is worth remembering.",
+                    },
+                    "obsolete_facts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Snippets of the CURRENT memory that are now outdated or wrong "
+                        "and should be removed. Each item must be an exact substring of the current "
+                        "memory. Use an empty list when nothing should be removed.",
                     },
                 },
-                "required": ["history_entry", "memory_update"],
+                "required": ["history_entry"],
             },
         },
     }
@@ -57,6 +68,37 @@ def _normalize_save_memory_args(args: Any) -> dict[str, Any] | None:
     if isinstance(args, list):
         return args[0] if args and isinstance(args[0], dict) else None
     return args if isinstance(args, dict) else None
+
+
+def _apply_memory_update(current: str, args: dict[str, Any]) -> str:
+    """Compute the new long-term memory from an incremental save_memory payload.
+
+    Supports two shapes:
+    - Legacy full rewrite: ``memory_update`` carries the entire memory.
+    - Incremental (default): ``new_facts`` is appended and ``obsolete_facts``
+      snippets are removed. This keeps tool-call output small so it never gets
+      truncated by max_tokens, regardless of how large the memory grows.
+    """
+    if args.get("memory_update") is not None:
+        return _ensure_text(args["memory_update"])
+
+    obsolete = args.get("obsolete_facts") or []
+    new_facts = _ensure_text(args.get("new_facts") or "").strip()
+    if not obsolete and not new_facts:
+        return current  # nothing to change
+
+    updated = current
+    if isinstance(obsolete, list):
+        for snippet in obsolete:
+            text = _ensure_text(snippet)
+            if text and text in updated:
+                updated = updated.replace(text, "")
+
+    if new_facts:
+        updated = f"{updated.rstrip()}\n\n{new_facts}\n" if updated.strip() else f"{new_facts}\n"
+
+    # Collapse blank-line runs left behind by removals / appends.
+    return re.sub(r"\n{3,}", "\n\n", updated).lstrip("\n")
 
 _TOOL_CHOICE_ERROR_MARKERS = (
     "tool_choice",
@@ -116,6 +158,7 @@ class MemoryStore:
         messages: list[dict],
         provider: LLMProvider,
         model: str,
+        max_tokens: int | None = None,
     ) -> bool:
         """Consolidate the provided message chunk into MEMORY.md + HISTORY.md."""
         if not messages:
@@ -124,6 +167,10 @@ class MemoryStore:
         current_memory = self.read_long_term()
         prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
 
+Update long-term memory INCREMENTALLY: put genuinely new durable facts in `new_facts`,
+list any now-outdated snippets of the current memory in `obsolete_facts`, and leave both
+empty when nothing changed. Never paste the whole memory back.
+
 ## Current Long-term Memory
 {current_memory or "(empty)"}
 
@@ -131,9 +178,11 @@ class MemoryStore:
 {self._format_messages(messages)}"""
 
         chat_messages = [
-            {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
+            {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with an incremental update (new_facts / obsolete_facts) of the conversation."},
             {"role": "user", "content": prompt},
         ]
+
+        extra = {"max_tokens": max_tokens} if max_tokens is not None else {}
 
         try:
             forced = {"type": "function", "function": {"name": "save_memory"}}
@@ -142,6 +191,7 @@ class MemoryStore:
                 tools=_SAVE_MEMORY_TOOL,
                 model=model,
                 tool_choice=forced,
+                **extra,
             )
 
             if response.finish_reason == "error" and _is_tool_choice_unsupported(
@@ -153,6 +203,7 @@ class MemoryStore:
                     tools=_SAVE_MEMORY_TOOL,
                     model=model,
                     tool_choice="auto",
+                    **extra,
                 )
 
             if not response.has_tool_calls:
@@ -170,24 +221,17 @@ class MemoryStore:
                 logger.warning("Memory consolidation: unexpected save_memory arguments")
                 return self._fail_or_raw_archive(messages)
 
-            if "history_entry" not in args or "memory_update" not in args:
-                logger.warning("Memory consolidation: save_memory payload missing required fields")
+            if "history_entry" not in args or args["history_entry"] is None:
+                logger.warning("Memory consolidation: save_memory payload missing history_entry")
                 return self._fail_or_raw_archive(messages)
 
-            entry = args["history_entry"]
-            update = args["memory_update"]
-
-            if entry is None or update is None:
-                logger.warning("Memory consolidation: save_memory payload contains null required fields")
-                return self._fail_or_raw_archive(messages)
-
-            entry = _ensure_text(entry).strip()
+            entry = _ensure_text(args["history_entry"]).strip()
             if not entry:
                 logger.warning("Memory consolidation: history_entry is empty after normalization")
                 return self._fail_or_raw_archive(messages)
 
             self.append_history(entry)
-            update = _ensure_text(update)
+            update = _apply_memory_update(current_memory, args)
             if update != current_memory:
                 self.write_long_term(update)
 
@@ -226,6 +270,12 @@ class MemoryConsolidator:
 
     _SAFETY_BUFFER = 1024  # extra headroom for tokenizer estimation drift
 
+    # Floor for the consolidation tool-call output. Incremental updates keep the
+    # payload small, but the history_entry plus new_facts on a busy chunk can still
+    # be a few thousand tokens, so guarantee comfortable headroom regardless of the
+    # provider's (often 4096) default completion budget.
+    _MIN_CONSOLIDATION_MAX_TOKENS = 8192
+
     def __init__(
         self,
         workspace: Path,
@@ -243,6 +293,13 @@ class MemoryConsolidator:
         self.sessions = sessions
         self.context_window_tokens = context_window_tokens
         self.max_completion_tokens = max_completion_tokens
+        try:
+            _base_max_tokens = int(max_completion_tokens)
+        except (TypeError, ValueError):
+            _base_max_tokens = 4096
+        self.consolidation_max_tokens = max(
+            _base_max_tokens, self._MIN_CONSOLIDATION_MAX_TOKENS
+        )
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
@@ -253,7 +310,9 @@ class MemoryConsolidator:
 
     async def consolidate_messages(self, messages: list[dict[str, object]]) -> bool:
         """Archive a selected message chunk into persistent memory."""
-        return await self.store.consolidate(messages, self.provider, self.model)
+        return await self.store.consolidate(
+            messages, self.provider, self.model, max_tokens=self.consolidation_max_tokens
+        )
 
     def pick_consolidation_boundary(
         self,

@@ -266,8 +266,8 @@ class TestMemoryConsolidationTypeHandling:
         assert not store.memory_file.exists()
 
     @pytest.mark.asyncio
-    async def test_missing_memory_update_returns_false_without_writing(self, tmp_path: Path) -> None:
-        """Do not append history if memory_update is missing."""
+    async def test_history_only_payload_is_incremental_noop(self, tmp_path: Path) -> None:
+        """history_entry with no new_facts/obsolete_facts: archive history, leave memory untouched."""
         store = MemoryStore(tmp_path)
         provider = AsyncMock()
         provider.chat_with_retry = AsyncMock(
@@ -277,7 +277,7 @@ class TestMemoryConsolidationTypeHandling:
                     ToolCallRequest(
                         id="call_1",
                         name="save_memory",
-                        arguments={"history_entry": "[2026-01-01] Partial output."},
+                        arguments={"history_entry": "[2026-01-01] Nothing durable learned."},
                     )
                 ],
             )
@@ -286,9 +286,42 @@ class TestMemoryConsolidationTypeHandling:
 
         result = await store.consolidate(messages, provider, "test-model")
 
-        assert result is False
-        assert not store.history_file.exists()
+        assert result is True
+        assert "[2026-01-01] Nothing durable learned." in store.history_file.read_text()
+        # No new_facts and no prior memory -> memory file is never written.
         assert not store.memory_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_incremental_new_facts_appended_to_existing_memory(self, tmp_path: Path) -> None:
+        """new_facts are appended to current memory; obsolete_facts snippets are removed."""
+        store = MemoryStore(tmp_path)
+        store.write_long_term("# Memory\n- User likes tea.\n- Old fact to drop.")
+        provider = AsyncMock()
+        provider.chat_with_retry = AsyncMock(
+            return_value=LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_1",
+                        name="save_memory",
+                        arguments={
+                            "history_entry": "[2026-01-01] Learned a preference.",
+                            "new_facts": "- User prefers Python.",
+                            "obsolete_facts": ["- Old fact to drop."],
+                        },
+                    )
+                ],
+            )
+        )
+        messages = _make_messages(message_count=60)
+
+        result = await store.consolidate(messages, provider, "test-model")
+
+        assert result is True
+        memory = store.memory_file.read_text()
+        assert "- User likes tea." in memory
+        assert "- User prefers Python." in memory
+        assert "Old fact to drop." not in memory
 
     @pytest.mark.asyncio
     async def test_null_required_field_returns_false_without_writing(self, tmp_path: Path) -> None:
