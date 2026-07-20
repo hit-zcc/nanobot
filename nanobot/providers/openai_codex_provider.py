@@ -35,10 +35,12 @@ class OpenAICodexProvider(LLMProvider):
         self,
         default_model: str = "openai-codex/gpt-5.6-sol",
         credential_manager: CodexCredentialManager | None = None,
+        service_tier: str | None = None,
     ):
         super().__init__(api_key=None, api_base=None)
         self.default_model = default_model
         self.credentials = credential_manager or CodexCredentialManager()
+        self.service_tier = service_tier
         self._continuations: OrderedDict[
             ContinuationKey, tuple[float, list[dict[str, Any]]]
         ] = OrderedDict()
@@ -152,6 +154,9 @@ class OpenAICodexProvider(LLMProvider):
             body["tools"] = _convert_tools(tools)
 
         try:
+            service_tier = _resolve_service_tier(self.service_tier)
+            if service_tier:
+                body["service_tier"] = service_tier
             content, tool_calls, finish_reason, output_items = await self._request_with_auth(
                 body, on_content_delta=on_content_delta
             )
@@ -192,6 +197,14 @@ class OpenAICodexProvider(LLMProvider):
 
     def get_default_model(self) -> str:
         return self.default_model
+
+
+def _resolve_service_tier(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value == "fast":
+        return "priority"
+    raise ValueError("Unsupported Codex service tier. Use 'fast' or omit serviceTier")
 
 
 def _strip_model_prefix(model: str) -> str:

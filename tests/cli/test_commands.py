@@ -333,6 +333,30 @@ def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():
     assert _strip_model_prefix("openai-codex/gpt-5.6-sol") == "gpt-5.6-sol"
 
 
+def test_make_codex_provider_loads_configured_service_tier(tmp_path):
+    from nanobot.config.loader import load_config
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "defaults": {
+                        "provider": "openai_codex",
+                        "model": "openai-codex/gpt-5.6-sol",
+                        "serviceTier": "fast",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    provider = _make_provider(load_config(config_path))
+
+    assert provider.service_tier == "fast"
+
+
 def test_make_provider_passes_extra_headers_to_custom_provider():
     config = Config.model_validate(
         {

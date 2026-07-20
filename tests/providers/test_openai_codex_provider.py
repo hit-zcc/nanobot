@@ -30,6 +30,67 @@ def test_default_model_is_current_sol_model():
 
 
 @pytest.mark.asyncio
+async def test_fast_service_tier_sends_priority(monkeypatch):
+    provider = OpenAICodexProvider(
+        credential_manager=FakeCredentials(),
+        service_tier="fast",
+    )
+    seen_body = None
+
+    async def request(url, headers, body, on_content_delta=None):
+        nonlocal seen_body
+        seen_body = body
+        return "ok", [], "stop", []
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", request)
+
+    result = await provider.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert result.content == "ok"
+    assert seen_body["service_tier"] == "priority"
+
+
+@pytest.mark.asyncio
+async def test_omitted_service_tier_sends_no_field(monkeypatch):
+    provider = OpenAICodexProvider(credential_manager=FakeCredentials())
+    seen_body = None
+
+    async def request(url, headers, body, on_content_delta=None):
+        nonlocal seen_body
+        seen_body = body
+        return "ok", [], "stop", []
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", request)
+
+    result = await provider.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert result.content == "ok"
+    assert "service_tier" not in seen_body
+
+
+@pytest.mark.asyncio
+async def test_unknown_service_tier_fails_before_transport(monkeypatch):
+    provider = OpenAICodexProvider(
+        credential_manager=FakeCredentials(),
+        service_tier="turbo",
+    )
+    transport_called = False
+
+    async def request(url, headers, body, on_content_delta=None):
+        nonlocal transport_called
+        transport_called = True
+        return "ok", [], "stop", []
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", request)
+
+    result = await provider.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert result.finish_reason == "error"
+    assert result.content == "Error calling Codex: request failed"
+    assert transport_called is False
+
+
+@pytest.mark.asyncio
 async def test_encrypted_reasoning_is_replayed_before_tool_continuation(monkeypatch):
     reasoning_1 = {
         "id": "rs_1",

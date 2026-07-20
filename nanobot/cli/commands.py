@@ -418,7 +418,10 @@ def _make_provider(config: Config):
         provider = ClaudeOAuthProvider(default_model=model)
     elif backend == "openai_codex":
         from nanobot.providers.openai_codex_provider import OpenAICodexProvider
-        provider = OpenAICodexProvider(default_model=model)
+        provider = OpenAICodexProvider(
+            default_model=model,
+            service_tier=config.agents.defaults.service_tier,
+        )
     elif backend == "azure_openai":
         from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
         provider = AzureOpenAIProvider(
