@@ -10,7 +10,11 @@ from typer.testing import CliRunner
 from nanobot.bus.events import OutboundMessage
 from nanobot.cli.commands import _make_provider, app
 from nanobot.config.schema import Config
-from nanobot.providers.codex_credentials import CodexCredentialError, CodexCredentials
+from nanobot.providers.codex_credentials import (
+    CodexCredentialError,
+    CodexCredentialManager,
+    CodexCredentials,
+)
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_name
 
@@ -914,7 +918,8 @@ def test_channels_login_requires_channel_name() -> None:
 
 def test_openai_codex_login_reports_existing_chatgpt_login(monkeypatch):
     monkeypatch.setattr(
-        "nanobot.providers.codex_credentials.CodexCredentialManager.status",
+        CodexCredentialManager,
+        "status",
         lambda self: CodexCredentials("hidden-token", "acct-123"),
     )
 
@@ -930,7 +935,8 @@ def test_openai_codex_login_points_to_official_cli_when_missing(monkeypatch):
         raise CodexCredentialError("Codex ChatGPT login not found. Run: codex login")
 
     monkeypatch.setattr(
-        "nanobot.providers.codex_credentials.CodexCredentialManager.status",
+        CodexCredentialManager,
+        "status",
         missing,
     )
 
