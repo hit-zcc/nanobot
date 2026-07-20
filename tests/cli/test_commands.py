@@ -931,19 +931,24 @@ def test_openai_codex_login_reports_existing_chatgpt_login(monkeypatch):
     assert "hidden-token" not in result.output
 
 
-def test_openai_codex_login_rejects_stale_auth_when_cli_is_unavailable(monkeypatch):
+def test_openai_codex_login_rejects_stale_auth_when_cli_is_unavailable(
+    monkeypatch, tmp_path
+):
     secret_token = "hidden-stale-token"
     secret_account = "hidden-account"
-    monkeypatch.setattr(
-        CodexCredentialManager,
-        "status",
-        lambda self: CodexCredentials(secret_token, secret_account),
+    (tmp_path / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": secret_token,
+                    "account_id": secret_account,
+                },
+            }
+        )
     )
-
-    def unavailable(self):
-        raise CodexCredentialError("Official Codex CLI is not installed or not on PATH")
-
-    monkeypatch.setattr(CodexCredentialManager, "certify_cli_available", unavailable)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    monkeypatch.setattr("nanobot.providers.codex_credentials.shutil.which", lambda _: None)
 
     result = runner.invoke(app, ["provider", "login", "openai-codex"])
 

@@ -63,6 +63,15 @@ def test_status_rejects_malformed_auth_json_without_leaking_payload(tmp_path):
     assert secret not in str(exc.value)
 
 
+def test_status_rejects_invalid_utf8_auth_without_leaking_bytes(tmp_path):
+    (tmp_path / "auth.json").write_bytes(b'\xffsecret-auth-bytes')
+
+    with pytest.raises(CodexCredentialError, match="unreadable") as exc:
+        CodexCredentialManager(codex_home=tmp_path).status()
+
+    assert "secret-auth-bytes" not in str(exc.value)
+
+
 @pytest.mark.parametrize(
     "payload, message",
     [
@@ -342,6 +351,70 @@ async def test_refresh_rejects_malformed_json_rpc_message(monkeypatch, tmp_path)
         await manager._refresh_with_codex()
 
     assert "secret" not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_refresh_rejects_invalid_utf8_rpc_message(monkeypatch, tmp_path):
+    manager = CodexCredentialManager(codex_home=tmp_path, codex_executable="codex-test")
+    fake = FakeAppServerProcess([])
+    fake.stdout = _RawStdout([b"\xffsecret-rpc-bytes\n"])
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake.create)
+
+    with pytest.raises(CodexCredentialError, match="malformed") as exc:
+        await manager._refresh_with_codex()
+
+    assert "secret-rpc-bytes" not in str(exc.value)
+
+
+class _FakeMonotonicClock:
+    def __init__(self):
+        self.now = 100.0
+
+    def monotonic(self):
+        return self.now
+
+
+class _AdvancingStdout:
+    def __init__(self, clock):
+        self.clock = clock
+        self.next_id = 100
+        self.remaining = 2
+
+    async def readline(self):
+        if not self.remaining:
+            return b""
+        self.remaining -= 1
+        self.clock.now += 0.6
+        self.next_id += 1
+        return json.dumps({"id": self.next_id, "result": {}}).encode() + b"\n"
+
+
+@pytest.mark.asyncio
+async def test_refresh_uses_one_deadline_across_unmatched_messages(monkeypatch, tmp_path):
+    manager = CodexCredentialManager(
+        codex_home=tmp_path, codex_executable="codex-test", rpc_timeout_seconds=1.0
+    )
+    clock = _FakeMonotonicClock()
+    fake = FakeAppServerProcess([])
+    fake.stdout = _AdvancingStdout(clock)
+    monkeypatch.setattr("nanobot.providers.codex_credentials.time.monotonic", clock.monotonic)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake.create)
+
+    with pytest.raises(CodexCredentialError, match="timed out"):
+        await manager._refresh_with_codex()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [None, False, 0, "", []])
+async def test_refresh_rejects_response_with_falsey_error_member(
+    monkeypatch, tmp_path, error
+):
+    manager = CodexCredentialManager(codex_home=tmp_path, codex_executable="codex-test")
+    fake = FakeAppServerProcess([{"id": 1, "error": error, "result": {}}])
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake.create)
+
+    with pytest.raises(CodexCredentialError, match="rejected"):
+        await manager._refresh_with_codex()
 
 
 @pytest.mark.asyncio

@@ -42,7 +42,7 @@ class CodexCredentialManager:
             payload = json.loads(self.auth_path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
             raise CodexCredentialError("Codex ChatGPT login not found. Run: codex login") from exc
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise CodexCredentialError("Codex auth state is unreadable. Run: codex login") from exc
         if not isinstance(payload, dict):
             raise CodexCredentialError("Codex auth state is unreadable. Run: codex login")
@@ -187,11 +187,15 @@ class CodexCredentialManager:
     async def _read_response(self, proc, request_id: int) -> dict:
         if proc.stdout is None:
             raise CodexCredentialError("Codex app-server stdout is unavailable")
+        deadline = time.monotonic() + self.rpc_timeout_seconds
         while True:
-            try:
-                line = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=self.rpc_timeout_seconds
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CodexCredentialError(
+                    "Codex app-server authentication request timed out"
                 )
+            try:
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
             except asyncio.TimeoutError as exc:
                 raise CodexCredentialError(
                     "Codex app-server authentication request timed out"
@@ -202,13 +206,13 @@ class CodexCredentialManager:
                 )
             try:
                 message = json.loads(line)
-            except json.JSONDecodeError:
+            except (UnicodeDecodeError, json.JSONDecodeError):
                 raise CodexCredentialError("Codex app-server returned a malformed response") from None
             if not isinstance(message, dict):
                 raise CodexCredentialError("Codex app-server returned a malformed response")
             if message.get("id") != request_id:
                 continue
-            if message.get("error"):
+            if "error" in message:
                 raise CodexCredentialError("Codex app-server rejected the authentication request")
             if not isinstance(message.get("result"), dict):
                 raise CodexCredentialError("Codex app-server returned a malformed response")
