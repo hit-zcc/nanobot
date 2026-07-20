@@ -1,5 +1,6 @@
 import json
 import re
+import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,11 +18,6 @@ runner = CliRunner()
 
 class _StopGatewayError(RuntimeError):
     pass
-
-
-import shutil
-
-import pytest
 
 
 @pytest.fixture
@@ -320,6 +316,7 @@ def test_openai_compat_provider_passes_model_through():
 def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():
     assert _strip_model_prefix("openai-codex/gpt-5.1-codex") == "gpt-5.1-codex"
     assert _strip_model_prefix("openai_codex/gpt-5.1-codex") == "gpt-5.1-codex"
+    assert _strip_model_prefix("openai-codex/gpt-5.6-sol") == "gpt-5.6-sol"
 
 
 def test_make_provider_passes_extra_headers_to_custom_provider():

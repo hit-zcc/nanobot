@@ -2,28 +2,60 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from typing import Any, AsyncGenerator
 
 import httpx
-from loguru import logger
-from oauth_cli_kit import get_token as get_codex_token
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.codex_credentials import CodexCredentialManager
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "nanobot"
 
 
+class _CodexHTTPError(RuntimeError):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class OpenAICodexProvider(LLMProvider):
     """Use Codex OAuth to call the Responses API."""
 
-    def __init__(self, default_model: str = "openai-codex/gpt-5.1-codex"):
+    def __init__(
+        self,
+        default_model: str = "openai-codex/gpt-5.6-sol",
+        credential_manager: CodexCredentialManager | None = None,
+    ):
         super().__init__(api_key=None, api_base=None)
         self.default_model = default_model
+        self.credentials = credential_manager or CodexCredentialManager()
+
+    async def _request_with_auth(
+        self,
+        body: dict[str, Any],
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> tuple[str, list[ToolCallRequest], str]:
+        credentials = await self.credentials.get_credentials()
+        for attempt in range(2):
+            try:
+                return await _request_codex(
+                    DEFAULT_CODEX_URL,
+                    _build_headers(credentials.account_id, credentials.access_token),
+                    body,
+                    on_content_delta=on_content_delta,
+                )
+            except _CodexHTTPError as exc:
+                if exc.status_code != 401 or attempt == 1:
+                    raise
+                credentials = await self.credentials.get_credentials(
+                    force_refresh=True,
+                    rejected_access_token=credentials.access_token,
+                )
+        raise AssertionError("unreachable")
 
     async def _call_codex(
         self,
@@ -37,9 +69,6 @@ class OpenAICodexProvider(LLMProvider):
         """Shared request logic for both chat() and chat_stream()."""
         model = model or self.default_model
         system_prompt, input_items = _convert_messages(messages)
-
-        token = await asyncio.to_thread(get_codex_token)
-        headers = _build_headers(token.account_id, token.access)
 
         body: dict[str, Any] = {
             "model": _strip_model_prefix(model),
@@ -59,19 +88,9 @@ class OpenAICodexProvider(LLMProvider):
             body["tools"] = _convert_tools(tools)
 
         try:
-            try:
-                content, tool_calls, finish_reason = await _request_codex(
-                    DEFAULT_CODEX_URL, headers, body, verify=True,
-                    on_content_delta=on_content_delta,
-                )
-            except Exception as e:
-                if "CERTIFICATE_VERIFY_FAILED" not in str(e):
-                    raise
-                logger.warning("SSL verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason = await _request_codex(
-                    DEFAULT_CODEX_URL, headers, body, verify=False,
-                    on_content_delta=on_content_delta,
-                )
+            content, tool_calls, finish_reason = await self._request_with_auth(
+                body, on_content_delta=on_content_delta
+            )
             return LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish_reason)
         except Exception as e:
             return LLMResponse(content=f"Error calling Codex: {e}", finish_reason="error")
@@ -119,14 +138,16 @@ async def _request_codex(
     url: str,
     headers: dict[str, str],
     body: dict[str, Any],
-    verify: bool,
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[str, list[ToolCallRequest], str]:
-    async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
                 text = await response.aread()
-                raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
+                raise _CodexHTTPError(
+                    response.status_code,
+                    _friendly_error(response.status_code, text.decode("utf-8", "ignore")),
+                )
             return await _consume_sse(response, on_content_delta)
 
 
@@ -229,7 +250,7 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
     async for line in response.aiter_lines():
         if line == "":
             if buffer:
-                data_lines = [l[5:].strip() for l in buffer if l.startswith("data:")]
+                data_lines = [entry[5:].strip() for entry in buffer if entry.startswith("data:")]
                 buffer = []
                 if not data_lines:
                     continue
@@ -314,7 +335,9 @@ def _map_finish_reason(status: str | None) -> str:
     return _FINISH_REASON_MAP.get(status or "completed", "stop")
 
 
-def _friendly_error(status_code: int, raw: str) -> str:
+def _friendly_error(status_code: int, _raw: str) -> str:
     if status_code == 429:
         return "ChatGPT usage quota exceeded or rate limit triggered. Please try again later."
-    return f"HTTP {status_code}: {raw}"
+    if status_code == 401:
+        return "Codex authentication failed. Run: codex login"
+    return f"HTTP {status_code}: Codex request failed"
