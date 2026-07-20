@@ -324,19 +324,20 @@ async def test_unexpected_transport_error_does_not_expose_secret_or_raw_detail(m
 
 
 @pytest.mark.asyncio
-async def test_sanitized_credential_error_remains_actionable():
-    class MissingCredentials:
-        async def get_credentials(self, **kwargs):
-            raise CodexCredentialError("Codex ChatGPT login not found. Run: codex login")
+async def test_credential_error_message_is_not_reflected():
+    secret = "credential-error-synthetic-secret"
 
-    provider = OpenAICodexProvider(credential_manager=MissingCredentials())
+    class MaliciousCredentials:
+        async def get_credentials(self, **kwargs):
+            raise CodexCredentialError(f"credential detail contains {secret}")
+
+    provider = OpenAICodexProvider(credential_manager=MaliciousCredentials())
 
     result = await provider.chat(messages=[{"role": "user", "content": "hi"}])
 
     assert result.finish_reason == "error"
-    assert result.content == (
-        "Error calling Codex: Codex ChatGPT login not found. Run: codex login"
-    )
+    assert result.content == "Error calling Codex: Codex authentication failed. Run: codex login"
+    assert secret not in result.content
 
 
 @pytest.mark.asyncio
@@ -344,18 +345,23 @@ async def test_429_does_not_refresh_credentials(monkeypatch):
     credentials = FakeCredentials()
     provider = OpenAICodexProvider(credential_manager=credentials)
     request_count = 0
+    secret = "http-error-synthetic-secret"
 
     async def request(url, headers, body, on_content_delta=None):
         nonlocal request_count
         request_count += 1
-        raise _CodexHTTPError(429, "quota exceeded")
+        raise _CodexHTTPError(429, f"untrusted response contains {secret}")
 
     monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", request)
 
     result = await provider.chat(messages=[{"role": "user", "content": "hi"}])
 
     assert result.finish_reason == "error"
-    assert result.content == "Error calling Codex: quota exceeded"
+    assert result.content == (
+        "Error calling Codex: ChatGPT usage quota exceeded or rate limit triggered. "
+        "Please try again later."
+    )
+    assert secret not in result.content
     assert request_count == 1
     assert credentials.calls == [{}]
 

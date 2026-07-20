@@ -160,8 +160,16 @@ class OpenAICodexProvider(LLMProvider):
                     self._continuations.pop(continuation_key, None)
                 self._cache_continuation(messages, tool_calls, output_items)
             return LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish_reason)
-        except (CodexCredentialError, _CodexHTTPError) as e:
-            return LLMResponse(content=f"Error calling Codex: {e}", finish_reason="error")
+        except CodexCredentialError:
+            return LLMResponse(
+                content="Error calling Codex: Codex authentication failed. Run: codex login",
+                finish_reason="error",
+            )
+        except _CodexHTTPError as exc:
+            return LLMResponse(
+                content=f"Error calling Codex: {_friendly_error(exc.status_code, '')}",
+                finish_reason="error",
+            )
         except Exception:
             return LLMResponse(content="Error calling Codex: request failed", finish_reason="error")
 
