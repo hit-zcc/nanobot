@@ -124,7 +124,6 @@ async def test_encrypted_reasoning_is_replayed_before_tool_continuation(monkeypa
 
     provider = OpenAICodexProvider(credential_manager=FakeCredentials())
     monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", request)
-    provider.chat_with_retry = provider.chat
     tools = MagicMock()
     tools.get_definitions.return_value = []
     tools.execute = AsyncMock(side_effect=lambda name, arguments: f"{name} result")
