@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import os
 import shutil
@@ -43,6 +44,8 @@ class CodexCredentialManager:
             raise CodexCredentialError("Codex ChatGPT login not found. Run: codex login") from exc
         except (OSError, json.JSONDecodeError) as exc:
             raise CodexCredentialError("Codex auth state is unreadable. Run: codex login") from exc
+        if not isinstance(payload, dict):
+            raise CodexCredentialError("Codex auth state is unreadable. Run: codex login")
         if payload.get("auth_mode") != "chatgpt":
             raise CodexCredentialError("Codex must be logged in with ChatGPT. Run: codex login")
         tokens = payload.get("tokens") if isinstance(payload.get("tokens"), dict) else {}
@@ -58,9 +61,18 @@ class CodexCredentialManager:
             encoded = access_token.split(".")[1]
             encoded += "=" * (-len(encoded) % 4)
             payload = json.loads(base64.urlsafe_b64decode(encoded))
+            if not isinstance(payload, dict):
+                return None
             exp = payload.get("exp")
             return int(exp) if exp is not None else None
-        except (IndexError, ValueError, TypeError, json.JSONDecodeError):
+        except (
+            binascii.Error,
+            IndexError,
+            UnicodeDecodeError,
+            ValueError,
+            TypeError,
+            json.JSONDecodeError,
+        ):
             return None
 
     def _expires_soon(self, credentials: CodexCredentials) -> bool:
@@ -98,16 +110,21 @@ class CodexCredentialManager:
         executable = self.codex_executable or shutil.which("codex")
         if not executable:
             raise CodexCredentialError("Official Codex CLI is not installed or not on PATH")
-        proc = await asyncio.create_subprocess_exec(
-            executable,
-            "app-server",
-            "--listen",
-            "stdio://",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "CODEX_HOME": str(self.codex_home)},
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                executable,
+                "app-server",
+                "--listen",
+                "stdio://",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "CODEX_HOME": str(self.codex_home)},
+            )
+        except (OSError, ValueError):
+            raise CodexCredentialError(
+                "Unable to start official Codex CLI. Verify it is installed and executable"
+            ) from None
         try:
             await self._send(
                 proc,
@@ -140,7 +157,16 @@ class CodexCredentialManager:
                 await asyncio.wait_for(proc.wait(), timeout=2)
             except asyncio.TimeoutError:
                 proc.terminate()
-                await proc.wait()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=2)
+                    except asyncio.TimeoutError:
+                        raise CodexCredentialError(
+                            "Codex app-server did not stop after authentication refresh"
+                        ) from None
 
     async def _send(self, proc, message: dict) -> None:
         if proc.stdin is None:

@@ -56,9 +56,32 @@ def test_status_rejects_unusable_auth_without_leaking_payload(tmp_path, payload,
     assert "refresh_token" not in str(exc.value)
 
 
+@pytest.mark.parametrize("payload", [[], "chatgpt", 1, None])
+def test_status_rejects_non_object_auth_json(tmp_path, payload):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "auth.json").write_text(json.dumps(payload))
+
+    with pytest.raises(CodexCredentialError, match="unreadable"):
+        CodexCredentialManager(codex_home=tmp_path).status()
+
+
 def _jwt(exp: int) -> str:
     body = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode().rstrip("=")
     return f"header.{body}.signature"
+
+
+@pytest.mark.parametrize(
+    "access_token",
+    [
+        "not-a-jwt",
+        "header.a.signature",
+        "header._w.signature",
+        "header.W10.signature",
+        "header.Im5vdC1hbi1vYmplY3Qi.signature",
+    ],
+)
+def test_expires_at_returns_none_for_malformed_jwt(access_token):
+    assert CodexCredentialManager._expires_at(access_token) is None
 
 
 @pytest.mark.asyncio
@@ -137,6 +160,27 @@ class FakeAppServerProcess:
         self.returncode = -9
 
 
+class _StubbornAppServerProcess(FakeAppServerProcess):
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.wait_calls = 0
+        self.terminated = False
+        self.killed = False
+
+    async def wait(self):
+        self.wait_calls += 1
+        if self.wait_calls <= 2:
+            raise asyncio.TimeoutError
+        self.returncode = -9
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+
 @pytest.mark.asyncio
 async def test_refresh_app_server_protocol(monkeypatch, tmp_path):
     manager = CodexCredentialManager(codex_home=tmp_path, codex_executable="codex-test")
@@ -153,3 +197,34 @@ async def test_refresh_app_server_protocol(monkeypatch, tmp_path):
     assert sent[1] == {"method": "initialized", "params": {}}
     assert sent[2]["method"] == "account/read"
     assert sent[2]["params"] == {"refreshToken": True}
+
+
+@pytest.mark.asyncio
+async def test_refresh_wraps_subprocess_launch_failure(monkeypatch, tmp_path):
+    manager = CodexCredentialManager(codex_home=tmp_path, codex_executable="codex-test")
+
+    async def fail_launch(*args, **kwargs):
+        raise OSError("secret-launch-detail")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_launch)
+    with pytest.raises(CodexCredentialError, match="installed and executable") as exc:
+        await manager._refresh_with_codex()
+    assert "secret-launch-detail" not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_refresh_kills_process_when_terminate_does_not_stop_it(monkeypatch, tmp_path):
+    manager = CodexCredentialManager(codex_home=tmp_path, codex_executable="codex-test")
+    fake = _StubbornAppServerProcess(
+        [
+            {"id": 1, "result": {"codexHome": str(tmp_path)}},
+            {"id": 2, "result": {"account": {"type": "chatgpt"}}},
+        ]
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake.create)
+
+    await manager._refresh_with_codex()
+
+    assert fake.terminated is True
+    assert fake.killed is True
+    assert fake.wait_calls == 3
