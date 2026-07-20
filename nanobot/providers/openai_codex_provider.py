@@ -38,7 +38,7 @@ class OpenAICodexProvider(LLMProvider):
         self,
         body: dict[str, Any],
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
-    ) -> tuple[str, list[ToolCallRequest], str]:
+    ) -> tuple[str, list[ToolCallRequest], str, list[dict[str, Any]]]:
         credentials = await self.credentials.get_credentials()
         for attempt in range(2):
             try:
@@ -94,10 +94,15 @@ class OpenAICodexProvider(LLMProvider):
             body["tools"] = _convert_tools(tools)
 
         try:
-            content, tool_calls, finish_reason = await self._request_with_auth(
+            content, tool_calls, finish_reason, reasoning_items = await self._request_with_auth(
                 body, on_content_delta=on_content_delta
             )
-            return LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish_reason)
+            return LLMResponse(
+                content=content,
+                tool_calls=tool_calls,
+                finish_reason=finish_reason,
+                thinking_blocks=reasoning_items or None,
+            )
         except Exception as e:
             return LLMResponse(content=f"Error calling Codex: {e}", finish_reason="error")
 
@@ -145,7 +150,7 @@ async def _request_codex(
     headers: dict[str, str],
     body: dict[str, Any],
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
-) -> tuple[str, list[ToolCallRequest], str]:
+) -> tuple[str, list[ToolCallRequest], str, list[dict[str, Any]]]:
     async with httpx.AsyncClient(timeout=60.0) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
@@ -192,6 +197,9 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
             continue
 
         if role == "assistant":
+            for item in msg.get("thinking_blocks", []) or []:
+                if isinstance(item, dict) and item.get("type") == "reasoning":
+                    input_items.append(dict(item))
             if isinstance(content, str) and content:
                 input_items.append({
                     "type": "message", "role": "assistant",
@@ -274,9 +282,10 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
 async def _consume_sse(
     response: httpx.Response,
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
-) -> tuple[str, list[ToolCallRequest], str]:
+) -> tuple[str, list[ToolCallRequest], str, list[dict[str, Any]]]:
     content = ""
     tool_calls: list[ToolCallRequest] = []
+    reasoning_items: list[dict[str, Any]] = []
     tool_call_buffers: dict[str, dict[str, Any]] = {}
     finish_reason = "stop"
 
@@ -308,7 +317,9 @@ async def _consume_sse(
                 tool_call_buffers[call_id]["arguments"] = event.get("arguments") or ""
         elif event_type == "response.output_item.done":
             item = event.get("item") or {}
-            if item.get("type") == "function_call":
+            if item.get("type") == "reasoning" and item.get("encrypted_content"):
+                reasoning_items.append(dict(item))
+            elif item.get("type") == "function_call":
                 call_id = item.get("call_id")
                 if not call_id:
                     continue
@@ -331,7 +342,7 @@ async def _consume_sse(
         elif event_type in {"error", "response.failed"}:
             raise RuntimeError("Codex response failed")
 
-    return content, tool_calls, finish_reason
+    return content, tool_calls, finish_reason, reasoning_items
 
 
 _FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "error", "cancelled": "error"}
