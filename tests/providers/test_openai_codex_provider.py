@@ -5,7 +5,7 @@ import pytest
 
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.providers.base import ToolCallRequest
-from nanobot.providers.codex_credentials import CodexCredentials
+from nanobot.providers.codex_credentials import CodexCredentialError, CodexCredentials
 from nanobot.providers.openai_codex_provider import (
     _CONTINUATION_CACHE_LIMIT,
     OpenAICodexProvider,
@@ -302,6 +302,41 @@ async def test_401_refreshes_rejected_token_and_retries_once(monkeypatch):
     ]
     assert seen_headers[0]["Authorization"] == "Bearer rejected"
     assert seen_headers[1]["Authorization"] == "Bearer fresh"
+
+
+@pytest.mark.asyncio
+async def test_unexpected_transport_error_does_not_expose_secret_or_raw_detail(monkeypatch):
+    secret = "synthetic-secret-header-value"
+    raw_detail = "illegal header protocol detail"
+    provider = OpenAICodexProvider(credential_manager=FakeCredentials())
+
+    async def request(url, headers, body, on_content_delta=None):
+        raise RuntimeError(f"{raw_detail}: Bearer {secret}")
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", request)
+
+    result = await provider.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert result.finish_reason == "error"
+    assert result.content == "Error calling Codex: request failed"
+    assert secret not in result.content
+    assert raw_detail not in result.content
+
+
+@pytest.mark.asyncio
+async def test_sanitized_credential_error_remains_actionable():
+    class MissingCredentials:
+        async def get_credentials(self, **kwargs):
+            raise CodexCredentialError("Codex ChatGPT login not found. Run: codex login")
+
+    provider = OpenAICodexProvider(credential_manager=MissingCredentials())
+
+    result = await provider.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert result.finish_reason == "error"
+    assert result.content == (
+        "Error calling Codex: Codex ChatGPT login not found. Run: codex login"
+    )
 
 
 @pytest.mark.asyncio

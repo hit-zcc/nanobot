@@ -12,7 +12,7 @@ from typing import Any, AsyncGenerator
 import httpx
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from nanobot.providers.codex_credentials import CodexCredentialManager
+from nanobot.providers.codex_credentials import CodexCredentialError, CodexCredentialManager
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "nanobot"
@@ -160,8 +160,10 @@ class OpenAICodexProvider(LLMProvider):
                     self._continuations.pop(continuation_key, None)
                 self._cache_continuation(messages, tool_calls, output_items)
             return LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish_reason)
-        except Exception as e:
+        except (CodexCredentialError, _CodexHTTPError) as e:
             return LLMResponse(content=f"Error calling Codex: {e}", finish_reason="error")
+        except Exception:
+            return LLMResponse(content="Error calling Codex: request failed", finish_reason="error")
 
     async def chat(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
