@@ -23,6 +23,35 @@ def test_default_model_is_current_sol_model():
 
 
 @pytest.mark.asyncio
+async def test_nested_forced_tool_choice_is_sent_in_flat_responses_shape(monkeypatch):
+    provider = OpenAICodexProvider(credential_manager=FakeCredentials())
+    seen_body = None
+
+    async def request(url, headers, body, on_content_delta=None):
+        nonlocal seen_body
+        seen_body = body
+        return "ok", [], "stop"
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", request)
+
+    await provider.chat(
+        messages=[{"role": "user", "content": "save it"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "save_memory",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice={"type": "function", "function": {"name": "save_memory"}},
+    )
+
+    assert seen_body["tool_choice"] == {"type": "function", "name": "save_memory"}
+
+
+@pytest.mark.asyncio
 async def test_401_refreshes_rejected_token_and_retries_once(monkeypatch):
     credentials = FakeCredentials()
     provider = OpenAICodexProvider(credential_manager=credentials)

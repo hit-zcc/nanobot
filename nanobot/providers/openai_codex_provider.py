@@ -69,6 +69,12 @@ class OpenAICodexProvider(LLMProvider):
         """Shared request logic for both chat() and chat_stream()."""
         model = model or self.default_model
         system_prompt, input_items = _convert_messages(messages)
+        if (
+            isinstance(tool_choice, dict)
+            and tool_choice.get("type") == "function"
+            and isinstance(tool_choice.get("function"), dict)
+        ):
+            tool_choice = {"type": "function", "name": tool_choice["function"].get("name")}
 
         body: dict[str, Any] = {
             "model": _strip_model_prefix(model),
