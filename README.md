@@ -884,20 +884,28 @@ Config file: `~/.nanobot/config.json`
 <details>
 <summary><b>OpenAI Codex (OAuth)</b></summary>
 
-Codex uses OAuth instead of API keys. Requires a ChatGPT Plus or Pro account.
-No `providers.openaiCodex` block is needed in `config.json`; `nanobot provider login` stores the OAuth session outside config.
+Codex uses OAuth instead of API keys and requires a ChatGPT Plus or Pro account.
+Authenticate with the official Codex CLI first, then let nanobot verify that login:
 
 **1. Login:**
 ```bash
+codex login
+codex login status
 nanobot provider login openai-codex
 ```
+
+Credentials remain in `~/.codex/auth.json`, are refreshed by the official Codex CLI,
+and are not copied into nanobot configuration. No `providers.openaiCodex` block is
+needed in `config.json`.
 
 **2. Set model** (merge into `~/.nanobot/config.json`):
 ```json
 {
   "agents": {
     "defaults": {
-      "model": "openai-codex/gpt-5.1-codex"
+      "model": "openai-codex/gpt-5.6-sol",
+      "provider": "openai_codex",
+      "reasoningEffort": "medium"
     }
   }
 }
@@ -914,7 +922,8 @@ nanobot agent -c ~/.nanobot-telegram/config.json -m "Hello!"
 nanobot agent -c ~/.nanobot-telegram/config.json -w /tmp/nanobot-telegram-test -m "Hello!"
 ```
 
-> Docker users: use `docker run -it` for interactive OAuth login.
+> Docker users: run the official Codex CLI login where `~/.codex/auth.json` is
+> available to nanobot.
 
 </details>
 

@@ -17,6 +17,15 @@ from nanobot.providers.registry import find_by_name
 runner = CliRunner()
 
 
+def test_readme_codex_example_uses_current_model_and_official_login():
+    readme = Path("README.md").read_text(encoding="utf-8")
+    assert "codex login" in readme
+    assert '"model": "openai-codex/gpt-5.6-sol"' in readme
+    assert '"provider": "openai_codex"' in readme
+    assert '"reasoningEffort": "medium"' in readme
+    assert "openai-codex/gpt-5.1-codex" not in readme
+
+
 class _StopGatewayError(RuntimeError):
     pass
 
