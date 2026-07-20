@@ -155,7 +155,7 @@ async def test_encrypted_reasoning_is_replayed_before_tool_continuation(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_failed_continuation_keeps_cache_for_retry_then_evicts(monkeypatch):
+async def test_failed_status_keeps_continuation_for_next_request_then_evicts(monkeypatch):
     marker = "retry-only-encrypted-reasoning"
     reasoning = {"id": "rs_retry", "type": "reasoning", "encrypted_content": marker}
     function_call = {
@@ -178,7 +178,7 @@ async def test_failed_continuation_keeps_cache_for_retry_then_evicts(monkeypatch
         if len(request_bodies) == 1:
             return "", [tool_call], "stop", [reasoning, function_call]
         if len(request_bodies) == 2:
-            raise RuntimeError("temporary continuation failure")
+            return "", [], "error", []
         return "done", [], "stop", []
 
     provider = OpenAICodexProvider(credential_manager=FakeCredentials())

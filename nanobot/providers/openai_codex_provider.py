@@ -155,9 +155,10 @@ class OpenAICodexProvider(LLMProvider):
             content, tool_calls, finish_reason, output_items = await self._request_with_auth(
                 body, on_content_delta=on_content_delta
             )
-            if continuation_key is not None:
-                self._continuations.pop(continuation_key, None)
-            self._cache_continuation(messages, tool_calls, output_items)
+            if finish_reason != "error":
+                if continuation_key is not None:
+                    self._continuations.pop(continuation_key, None)
+                self._cache_continuation(messages, tool_calls, output_items)
             return LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish_reason)
         except Exception as e:
             return LLMResponse(content=f"Error calling Codex: {e}", finish_reason="error")
