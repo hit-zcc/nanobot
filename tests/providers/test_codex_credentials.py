@@ -40,6 +40,29 @@ def test_status_uses_codex_home_environment(monkeypatch, tmp_path):
     assert CodexCredentialManager().status().account_id == "acct-1"
 
 
+def test_status_uses_default_codex_home(monkeypatch, tmp_path):
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _write_auth(tmp_path / ".codex")
+
+    assert CodexCredentialManager().status().account_id == "acct-1"
+
+
+def test_status_rejects_missing_auth_file(tmp_path):
+    with pytest.raises(CodexCredentialError, match="codex login"):
+        CodexCredentialManager(codex_home=tmp_path).status()
+
+
+def test_status_rejects_malformed_auth_json_without_leaking_payload(tmp_path):
+    secret = "secret-refresh-token"
+    (tmp_path / "auth.json").write_text(f'{{"refresh_token":"{secret}"')
+
+    with pytest.raises(CodexCredentialError, match="unreadable") as exc:
+        CodexCredentialManager(codex_home=tmp_path).status()
+
+    assert secret not in str(exc.value)
+
+
 @pytest.mark.parametrize(
     "payload, message",
     [
@@ -84,6 +107,12 @@ def test_expires_at_returns_none_for_malformed_jwt(access_token):
     assert CodexCredentialManager._expires_at(access_token) is None
 
 
+def test_expires_at_returns_none_when_exp_overflows_integer_conversion():
+    body = base64.urlsafe_b64encode(json.dumps({"exp": 1e1000}).encode()).decode().rstrip("=")
+
+    assert CodexCredentialManager._expires_at(f"header.{body}.signature") is None
+
+
 @pytest.mark.asyncio
 async def test_get_credentials_does_not_refresh_fresh_token(monkeypatch, tmp_path):
     _write_auth(tmp_path, access=_jwt(4_000_000_000))
@@ -94,6 +123,37 @@ async def test_get_credentials_does_not_refresh_fresh_token(monkeypatch, tmp_pat
 
     monkeypatch.setattr(manager, "_refresh_with_codex", unexpected_refresh)
     assert (await manager.get_credentials()).account_id == "acct-1"
+
+
+@pytest.mark.asyncio
+async def test_get_credentials_refreshes_expired_token(monkeypatch, tmp_path):
+    _write_auth(tmp_path, access=_jwt(1))
+    manager = CodexCredentialManager(codex_home=tmp_path)
+
+    async def refresh():
+        _write_auth(tmp_path, access=_jwt(4_000_000_000))
+
+    monkeypatch.setattr(manager, "_refresh_with_codex", refresh)
+
+    assert (await manager.get_credentials()).access_token == _jwt(4_000_000_000)
+
+
+@pytest.mark.asyncio
+async def test_force_refresh_rejects_unchanged_rejected_token(monkeypatch, tmp_path):
+    _write_auth(tmp_path, access="rejected-secret")
+    manager = CodexCredentialManager(codex_home=tmp_path)
+
+    async def refresh():
+        return None
+
+    monkeypatch.setattr(manager, "_refresh_with_codex", refresh)
+
+    with pytest.raises(CodexCredentialError, match="did not produce new credentials") as exc:
+        await manager.get_credentials(
+            force_refresh=True, rejected_access_token="rejected-secret"
+        )
+
+    assert "rejected-secret" not in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -119,6 +179,7 @@ async def test_force_refresh_uses_app_server_once_for_rejected_token(monkeypatch
 class _FakeStdin:
     def __init__(self, lines):
         self.lines = lines
+        self.closed = False
 
     def write(self, data: bytes):
         self.lines.append(data.decode().strip())
@@ -127,7 +188,7 @@ class _FakeStdin:
         return None
 
     def close(self):
-        return None
+        self.closed = True
 
 
 class _FakeStdout:
@@ -190,13 +251,141 @@ async def test_refresh_app_server_protocol(monkeypatch, tmp_path):
             {"id": 2, "result": {"account": {"type": "chatgpt"}}},
         ]
     )
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake.create)
+    launch_kwargs = {}
+
+    async def create(*args, **kwargs):
+        launch_kwargs.update(kwargs)
+        return await fake.create(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
     await manager._refresh_with_codex()
     sent = [json.loads(line) for line in fake.stdin_lines]
     assert sent[0]["method"] == "initialize"
     assert sent[1] == {"method": "initialized", "params": {}}
     assert sent[2]["method"] == "account/read"
     assert sent[2]["params"] == {"refreshToken": True}
+    assert launch_kwargs["stderr"] is asyncio.subprocess.DEVNULL
+
+
+def test_certify_cli_available_rejects_unresolvable_executable(monkeypatch, tmp_path):
+    monkeypatch.setattr("shutil.which", lambda executable: None)
+    manager = CodexCredentialManager(codex_home=tmp_path)
+
+    with pytest.raises(CodexCredentialError, match="installed.*PATH"):
+        manager.certify_cli_available()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [42, "response", [], None])
+async def test_refresh_rejects_scalar_rpc_response(monkeypatch, tmp_path, response):
+    manager = CodexCredentialManager(codex_home=tmp_path, codex_executable="codex-test")
+    fake = FakeAppServerProcess([response])
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake.create)
+
+    with pytest.raises(CodexCredentialError, match="malformed"):
+        await manager._refresh_with_codex()
+
+
+@pytest.mark.asyncio
+async def test_refresh_rejects_scalar_rpc_result(monkeypatch, tmp_path):
+    manager = CodexCredentialManager(codex_home=tmp_path, codex_executable="codex-test")
+    fake = FakeAppServerProcess(
+        [{"id": 1, "result": {}}, {"id": 2, "result": "secret-result"}]
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake.create)
+
+    with pytest.raises(CodexCredentialError, match="malformed") as exc:
+        await manager._refresh_with_codex()
+
+    assert "secret-result" not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_refresh_sanitizes_rpc_error(monkeypatch, tmp_path):
+    manager = CodexCredentialManager(codex_home=tmp_path, codex_executable="codex-test")
+    fake = FakeAppServerProcess(
+        [{"id": 1, "error": {"message": "secret-server-detail"}}]
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake.create)
+
+    with pytest.raises(CodexCredentialError, match="rejected") as exc:
+        await manager._refresh_with_codex()
+
+    assert "secret-server-detail" not in str(exc.value)
+
+
+class _BlockingStdout:
+    def __init__(self):
+        self.started = asyncio.Event()
+
+    async def readline(self):
+        self.started.set()
+        await asyncio.Event().wait()
+
+
+class _RawStdout:
+    def __init__(self, lines):
+        self.lines = list(lines)
+
+    async def readline(self):
+        return self.lines.pop(0) if self.lines else b""
+
+
+@pytest.mark.asyncio
+async def test_refresh_rejects_malformed_json_rpc_message(monkeypatch, tmp_path):
+    manager = CodexCredentialManager(codex_home=tmp_path, codex_executable="codex-test")
+    fake = FakeAppServerProcess([])
+    fake.stdout = _RawStdout([b'{"id":1,"result":"secret"\n'])
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake.create)
+
+    with pytest.raises(CodexCredentialError, match="malformed") as exc:
+        await manager._refresh_with_codex()
+
+    assert "secret" not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_refresh_reports_early_app_server_exit(monkeypatch, tmp_path):
+    manager = CodexCredentialManager(codex_home=tmp_path, codex_executable="codex-test")
+    fake = FakeAppServerProcess([])
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake.create)
+
+    with pytest.raises(CodexCredentialError, match="stopped"):
+        await manager._refresh_with_codex()
+
+
+@pytest.mark.asyncio
+async def test_refresh_times_out_and_cleans_up_process(monkeypatch, tmp_path):
+    manager = CodexCredentialManager(
+        codex_home=tmp_path, codex_executable="codex-test", rpc_timeout_seconds=0.01
+    )
+    fake = FakeAppServerProcess([])
+    fake.stdout = _BlockingStdout()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake.create)
+
+    with pytest.raises(CodexCredentialError, match="timed out"):
+        await manager._refresh_with_codex()
+
+    assert fake.stdin.closed is True
+    assert fake.returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_cancellation_cleans_up_process(monkeypatch, tmp_path):
+    manager = CodexCredentialManager(codex_home=tmp_path, codex_executable="codex-test")
+    fake = FakeAppServerProcess([])
+    fake.stdout = _BlockingStdout()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake.create)
+
+    task = asyncio.create_task(manager._refresh_with_codex())
+    await fake.stdout.started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert fake.stdin.closed is True
+    assert fake.returncode == 0
 
 
 @pytest.mark.asyncio

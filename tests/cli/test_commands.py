@@ -917,6 +917,7 @@ def test_channels_login_requires_channel_name() -> None:
 
 
 def test_openai_codex_login_reports_existing_chatgpt_login(monkeypatch):
+    monkeypatch.setattr(CodexCredentialManager, "certify_cli_available", lambda self: "codex")
     monkeypatch.setattr(
         CodexCredentialManager,
         "status",
@@ -930,6 +931,30 @@ def test_openai_codex_login_reports_existing_chatgpt_login(monkeypatch):
     assert "hidden-token" not in result.output
 
 
+def test_openai_codex_login_rejects_stale_auth_when_cli_is_unavailable(monkeypatch):
+    secret_token = "hidden-stale-token"
+    secret_account = "hidden-account"
+    monkeypatch.setattr(
+        CodexCredentialManager,
+        "status",
+        lambda self: CodexCredentials(secret_token, secret_account),
+    )
+
+    def unavailable(self):
+        raise CodexCredentialError("Official Codex CLI is not installed or not on PATH")
+
+    monkeypatch.setattr(CodexCredentialManager, "certify_cli_available", unavailable)
+
+    result = runner.invoke(app, ["provider", "login", "openai-codex"])
+
+    assert result.exit_code != 0
+    assert "Codex CLI" in result.output
+    assert "install" in result.output
+    assert "PATH" in result.output
+    assert secret_token not in result.output
+    assert secret_account not in result.output
+
+
 def test_openai_codex_login_points_to_official_cli_when_missing(monkeypatch):
     def missing(self):
         raise CodexCredentialError("Codex ChatGPT login not found. Run: codex login")
@@ -939,6 +964,7 @@ def test_openai_codex_login_points_to_official_cli_when_missing(monkeypatch):
         "status",
         missing,
     )
+    monkeypatch.setattr(CodexCredentialManager, "certify_cli_available", lambda self: "codex")
 
     result = runner.invoke(app, ["provider", "login", "openai-codex"])
 

@@ -1196,7 +1196,9 @@ def _login_openai_codex() -> None:
     )
 
     try:
-        credentials = CodexCredentialManager().status()
+        manager = CodexCredentialManager()
+        manager.certify_cli_available()
+        credentials = manager.status()
     except CodexCredentialError as exc:
         console.print(f"[red]✗ {exc}[/red]")
         raise typer.Exit(1) from exc
