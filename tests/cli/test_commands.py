@@ -948,7 +948,7 @@ def test_openai_codex_login_rejects_stale_auth_when_cli_is_unavailable(
         )
     )
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    monkeypatch.setattr("nanobot.providers.codex_credentials.shutil.which", lambda _: None)
+    monkeypatch.setattr(shutil, "which", lambda _: None)
 
     result = runner.invoke(app, ["provider", "login", "openai-codex"])
 
