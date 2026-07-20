@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from typing import Any, AsyncGenerator
 
@@ -14,6 +16,10 @@ from nanobot.providers.codex_credentials import CodexCredentialManager
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "nanobot"
+_CONTINUATION_CACHE_LIMIT = 32
+_CONTINUATION_CACHE_TTL_SECONDS = 300.0
+
+ContinuationKey = tuple[str, tuple[str, ...]]
 
 
 class _CodexHTTPError(RuntimeError):
@@ -33,6 +39,53 @@ class OpenAICodexProvider(LLMProvider):
         super().__init__(api_key=None, api_base=None)
         self.default_model = default_model
         self.credentials = credential_manager or CodexCredentialManager()
+        self._continuations: OrderedDict[
+            ContinuationKey, tuple[float, list[dict[str, Any]]]
+        ] = OrderedDict()
+
+    def _prune_continuations(self) -> None:
+        cutoff = time.monotonic() - _CONTINUATION_CACHE_TTL_SECONDS
+        expired = [key for key, (created_at, _) in self._continuations.items() if created_at < cutoff]
+        for key in expired:
+            self._continuations.pop(key, None)
+        while len(self._continuations) > _CONTINUATION_CACHE_LIMIT:
+            self._continuations.popitem(last=False)
+
+    def _find_continuation(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[ContinuationKey | None, int | None, list[dict[str, Any]] | None]:
+        self._prune_continuations()
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if message.get("role") != "assistant" or not message.get("tool_calls"):
+                continue
+            call_ids = tuple(
+                call.get("id")
+                for call in message["tool_calls"]
+                if isinstance(call, dict) and isinstance(call.get("id"), str)
+            )
+            if len(call_ids) != len(message["tool_calls"]):
+                return None, None, None
+            key = (_prompt_cache_key(messages[:index]), call_ids)
+            cached = self._continuations.get(key)
+            if cached is not None:
+                self._continuations.move_to_end(key)
+                return key, index, [dict(item) for item in cached[1]]
+            return None, None, None
+        return None, None, None
+
+    def _cache_continuation(
+        self,
+        messages: list[dict[str, Any]],
+        tool_calls: list[ToolCallRequest],
+        output_items: list[dict[str, Any]],
+    ) -> None:
+        if not tool_calls or not any(item.get("type") == "reasoning" for item in output_items):
+            return
+        key = (_prompt_cache_key(messages), tuple(call.id for call in tool_calls))
+        self._continuations[key] = (time.monotonic(), [dict(item) for item in output_items])
+        self._continuations.move_to_end(key)
+        self._prune_continuations()
 
     async def _request_with_auth(
         self,
@@ -68,7 +121,12 @@ class OpenAICodexProvider(LLMProvider):
     ) -> LLMResponse:
         """Shared request logic for both chat() and chat_stream()."""
         model = model or self.default_model
-        system_prompt, input_items = _convert_messages(messages)
+        continuation_key, assistant_index, continuation_items = self._find_continuation(messages)
+        system_prompt, input_items = _convert_messages(
+            messages,
+            continuation_assistant_index=assistant_index,
+            continuation_items=continuation_items,
+        )
         if (
             isinstance(tool_choice, dict)
             and tool_choice.get("type") == "function"
@@ -94,15 +152,13 @@ class OpenAICodexProvider(LLMProvider):
             body["tools"] = _convert_tools(tools)
 
         try:
-            content, tool_calls, finish_reason, reasoning_items = await self._request_with_auth(
+            content, tool_calls, finish_reason, output_items = await self._request_with_auth(
                 body, on_content_delta=on_content_delta
             )
-            return LLMResponse(
-                content=content,
-                tool_calls=tool_calls,
-                finish_reason=finish_reason,
-                thinking_blocks=reasoning_items or None,
-            )
+            if continuation_key is not None:
+                self._continuations.pop(continuation_key, None)
+            self._cache_continuation(messages, tool_calls, output_items)
+            return LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish_reason)
         except Exception as e:
             return LLMResponse(content=f"Error calling Codex: {e}", finish_reason="error")
 
@@ -180,7 +236,12 @@ def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return converted
 
 
-def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+def _convert_messages(
+    messages: list[dict[str, Any]],
+    *,
+    continuation_assistant_index: int | None = None,
+    continuation_items: list[dict[str, Any]] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
     system_prompt = ""
     input_items: list[dict[str, Any]] = []
 
@@ -197,15 +258,15 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
             continue
 
         if role == "assistant":
-            for item in msg.get("thinking_blocks", []) or []:
-                if isinstance(item, dict) and item.get("type") == "reasoning":
-                    input_items.append(dict(item))
             if isinstance(content, str) and content:
                 input_items.append({
                     "type": "message", "role": "assistant",
                     "content": [{"type": "output_text", "text": content}],
                     "status": "completed", "id": f"msg_{idx}",
                 })
+            if idx == continuation_assistant_index and continuation_items is not None:
+                input_items.extend(dict(item) for item in continuation_items)
+                continue
             for tool_call in msg.get("tool_calls", []) or []:
                 fn = tool_call.get("function") or {}
                 call_id, item_id = _split_tool_call_id(tool_call.get("id"))
@@ -284,10 +345,10 @@ async def _consume_sse(
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[str, list[ToolCallRequest], str, list[dict[str, Any]]]:
     content = ""
-    tool_calls: list[ToolCallRequest] = []
-    reasoning_items: list[dict[str, Any]] = []
+    completed_output: list[tuple[int, int, dict[str, Any]]] = []
     tool_call_buffers: dict[str, dict[str, Any]] = {}
     finish_reason = "stop"
+    completion_order = 0
 
     async for event in _iter_sse(response):
         event_type = event.get("type")
@@ -317,32 +378,45 @@ async def _consume_sse(
                 tool_call_buffers[call_id]["arguments"] = event.get("arguments") or ""
         elif event_type == "response.output_item.done":
             item = event.get("item") or {}
-            if item.get("type") == "reasoning" and item.get("encrypted_content"):
-                reasoning_items.append(dict(item))
-            elif item.get("type") == "function_call":
-                call_id = item.get("call_id")
-                if not call_id:
-                    continue
-                buf = tool_call_buffers.get(call_id) or {}
-                args_raw = buf.get("arguments") or item.get("arguments") or "{}"
-                try:
-                    args = json.loads(args_raw)
-                except Exception:
-                    args = {"raw": args_raw}
-                tool_calls.append(
-                    ToolCallRequest(
-                        id=f"{call_id}|{buf.get('id') or item.get('id') or 'fc_0'}",
-                        name=buf.get("name") or item.get("name"),
-                        arguments=args,
-                    )
-                )
+            if item.get("type") in {"reasoning", "function_call"}:
+                output_index = event.get("output_index")
+                order = output_index if isinstance(output_index, int) else completion_order
+                completed_output.append((order, completion_order, dict(item)))
+                completion_order += 1
         elif event_type == "response.completed":
             status = (event.get("response") or {}).get("status")
             finish_reason = _map_finish_reason(status)
         elif event_type in {"error", "response.failed"}:
             raise RuntimeError("Codex response failed")
 
-    return content, tool_calls, finish_reason, reasoning_items
+    completed_output.sort(key=lambda entry: (entry[0], entry[1]))
+    output_items: list[dict[str, Any]] = []
+    tool_calls: list[ToolCallRequest] = []
+    for _, _, item in completed_output:
+        item_type = item.get("type")
+        if item_type == "reasoning":
+            if item.get("encrypted_content"):
+                output_items.append(item)
+            continue
+        call_id = item.get("call_id")
+        if not call_id:
+            continue
+        buf = tool_call_buffers.get(call_id) or {}
+        args_raw = buf.get("arguments") or item.get("arguments") or "{}"
+        try:
+            args = json.loads(args_raw)
+        except Exception:
+            args = {"raw": args_raw}
+        tool_calls.append(
+            ToolCallRequest(
+                id=f"{call_id}|{buf.get('id') or item.get('id') or 'fc_0'}",
+                name=buf.get("name") or item.get("name"),
+                arguments=args,
+            )
+        )
+        output_items.append(item)
+
+    return content, tool_calls, finish_reason, output_items
 
 
 _FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "error", "cancelled": "error"}

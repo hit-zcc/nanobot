@@ -4,8 +4,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
+from nanobot.providers.base import ToolCallRequest
 from nanobot.providers.codex_credentials import CodexCredentials
 from nanobot.providers.openai_codex_provider import (
+    _CONTINUATION_CACHE_LIMIT,
     OpenAICodexProvider,
     _CodexHTTPError,
     _consume_sse,
@@ -29,14 +31,35 @@ def test_default_model_is_current_sol_model():
 
 @pytest.mark.asyncio
 async def test_encrypted_reasoning_is_replayed_before_tool_continuation(monkeypatch):
-    reasoning_item = {
+    reasoning_1 = {
         "id": "rs_1",
         "type": "reasoning",
-        "encrypted_content": "synthetic-encrypted-reasoning",
+        "encrypted_content": "synthetic-encrypted-reasoning-1",
         "summary": [],
     }
+    reasoning_2 = {
+        "id": "rs_2",
+        "type": "reasoning",
+        "encrypted_content": "synthetic-encrypted-reasoning-2",
+        "summary": [],
+    }
+    function_call_1 = {
+        "id": "fc_1",
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "list_dir",
+        "arguments": '{"path":"."}',
+        "status": "completed",
+    }
+    function_call_2 = {
+        "id": "fc_2",
+        "type": "function_call",
+        "call_id": "call_2",
+        "name": "read_file",
+        "arguments": '{"path":"README.md"}',
+        "status": "completed",
+    }
     first_events = [
-        {"type": "response.output_item.done", "item": reasoning_item},
         {
             "type": "response.output_item.added",
             "item": {
@@ -48,14 +71,34 @@ async def test_encrypted_reasoning_is_replayed_before_tool_continuation(monkeypa
             },
         },
         {
-            "type": "response.output_item.done",
+            "type": "response.output_item.added",
             "item": {
-                "id": "fc_1",
+                "id": "fc_2",
                 "type": "function_call",
-                "call_id": "call_1",
-                "name": "list_dir",
-                "arguments": '{"path":"."}',
+                "call_id": "call_2",
+                "name": "read_file",
+                "arguments": "",
             },
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 2,
+            "item": reasoning_2,
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 3,
+            "item": function_call_2,
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": reasoning_1,
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": function_call_1,
         },
         {"type": "response.completed", "response": {"status": "completed"}},
     ]
@@ -81,10 +124,10 @@ async def test_encrypted_reasoning_is_replayed_before_tool_continuation(monkeypa
 
     provider = OpenAICodexProvider(credential_manager=FakeCredentials())
     monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", request)
-    monkeypatch.setattr(provider, "_emit_log", lambda *args, **kwargs: None)
+    provider.chat_with_retry = provider.chat
     tools = MagicMock()
     tools.get_definitions.return_value = []
-    tools.execute = AsyncMock(return_value="tool result")
+    tools.execute = AsyncMock(side_effect=lambda name, arguments: f"{name} result")
 
     result = await AgentRunner(provider).run(
         AgentRunSpec(
@@ -98,16 +141,114 @@ async def test_encrypted_reasoning_is_replayed_before_tool_continuation(monkeypa
     assert result.final_content == "done"
     assert request_bodies[1]["input"] == [
         {"role": "user", "content": [{"type": "input_text", "text": "inspect"}]},
-        reasoning_item,
-        {
-            "type": "function_call",
-            "id": "fc_1",
-            "call_id": "call_1",
-            "name": "list_dir",
-            "arguments": '{"path": "."}',
-        },
-        {"type": "function_call_output", "call_id": "call_1", "output": "tool result"},
+        reasoning_1,
+        function_call_1,
+        reasoning_2,
+        function_call_2,
+        {"type": "function_call_output", "call_id": "call_1", "output": "list_dir result"},
+        {"type": "function_call_output", "call_id": "call_2", "output": "read_file result"},
     ]
+    serialized_messages = json.dumps(result.messages)
+    assert "synthetic-encrypted-reasoning" not in serialized_messages
+    assert all("thinking_blocks" not in message for message in result.messages)
+    assert "synthetic-encrypted-reasoning" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_failed_continuation_keeps_cache_for_retry_then_evicts(monkeypatch):
+    marker = "retry-only-encrypted-reasoning"
+    reasoning = {"id": "rs_retry", "type": "reasoning", "encrypted_content": marker}
+    function_call = {
+        "id": "fc_retry",
+        "type": "function_call",
+        "call_id": "call_retry",
+        "name": "list_dir",
+        "arguments": "{}",
+        "status": "completed",
+    }
+    tool_call = ToolCallRequest(
+        id="call_retry|fc_retry",
+        name="list_dir",
+        arguments={},
+    )
+    request_bodies = []
+
+    async def request(url, headers, body, on_content_delta=None):
+        request_bodies.append(body)
+        if len(request_bodies) == 1:
+            return "", [tool_call], "stop", [reasoning, function_call]
+        if len(request_bodies) == 2:
+            raise RuntimeError("temporary continuation failure")
+        return "done", [], "stop", []
+
+    provider = OpenAICodexProvider(credential_manager=FakeCredentials())
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", request)
+    initial_messages = [{"role": "user", "content": "inspect"}]
+    continuation_messages = [
+        *initial_messages,
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [tool_call.to_openai_tool_call()],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "name": tool_call.name,
+            "content": "tool result",
+        },
+    ]
+
+    first = await provider.chat(initial_messages)
+    failed = await provider.chat(continuation_messages)
+    retried = await provider.chat(continuation_messages)
+    after_success = await provider.chat(continuation_messages)
+
+    assert first.thinking_blocks is None
+    assert marker not in repr(first)
+    assert failed.finish_reason == "error"
+    assert retried.content == after_success.content == "done"
+    assert marker in json.dumps(request_bodies[1]["input"])
+    assert marker in json.dumps(request_bodies[2]["input"])
+    assert marker not in json.dumps(request_bodies[3]["input"])
+
+
+@pytest.mark.asyncio
+async def test_continuation_cache_is_bounded(monkeypatch):
+    request_count = 0
+
+    async def request(url, headers, body, on_content_delta=None):
+        nonlocal request_count
+        request_count += 1
+        call_id = f"call_{request_count}"
+        item_id = f"fc_{request_count}"
+        return (
+            "",
+            [ToolCallRequest(id=f"{call_id}|{item_id}", name="tool", arguments={})],
+            "stop",
+            [
+                {
+                    "id": f"rs_{request_count}",
+                    "type": "reasoning",
+                    "encrypted_content": f"encrypted-{request_count}",
+                },
+                {
+                    "id": item_id,
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": "tool",
+                    "arguments": "{}",
+                },
+            ],
+        )
+
+    provider = OpenAICodexProvider(credential_manager=FakeCredentials())
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", request)
+
+    for index in range(_CONTINUATION_CACHE_LIMIT + 1):
+        await provider.chat([{"role": "user", "content": f"request {index}"}])
+
+    assert len(provider._continuations) == _CONTINUATION_CACHE_LIMIT
 
 
 @pytest.mark.asyncio
