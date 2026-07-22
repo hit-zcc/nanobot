@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.feishu import FeishuChannel, FeishuConfig, _FeishuStreamBuf
 
@@ -256,3 +257,70 @@ class TestSendMessageReturnsId:
         ch._client.im.v1.message.create.return_value = resp
         result = ch._send_message_sync("chat_id", "oc_chat1", "text", '{"text":"hi"}')
         assert result is None
+
+
+class TestToolProgressMessages:
+    @staticmethod
+    def _message(content: str, *, done: bool = False, **metadata) -> OutboundMessage:
+        return OutboundMessage(
+            channel="feishu",
+            chat_id="oc_chat1",
+            content=content,
+            metadata={
+                "_progress": True,
+                "_tool_progress_id": "progress-1",
+                "_tool_progress_done": done,
+                **metadata,
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_creates_once_then_patches_and_completes(self):
+        ch = _make_channel()
+        ch._client.im.v1.message.create.return_value = _mock_send_response("om_progress")
+        ch._client.im.v1.message.patch.return_value = _mock_content_response()
+
+        await ch.send(self._message("⏳ 正在执行命令 · 已用时 20 秒"))
+        await ch.send(self._message("⏳ 正在执行命令 · 已用时 50 秒"))
+        await ch.send(self._message("✅ 执行命令完成 · 共用时 1 分 2 秒", done=True))
+
+        assert ch._client.im.v1.message.create.call_count == 1
+        assert ch._client.im.v1.message.patch.call_count == 2
+        assert "progress-1" not in ch._tool_progress_messages
+
+    @pytest.mark.asyncio
+    async def test_completion_without_heartbeat_is_noop(self):
+        ch = _make_channel()
+
+        await ch.send(self._message("✅ 执行命令完成 · 共用时 1 秒", done=True))
+
+        ch._client.im.v1.message.create.assert_not_called()
+        ch._client.im.v1.message.patch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_patch_failure_does_not_create_replacement(self):
+        ch = _make_channel()
+        ch._client.im.v1.message.create.return_value = _mock_send_response("om_progress")
+        ch._client.im.v1.message.patch.return_value = _mock_content_response(False)
+
+        await ch.send(self._message("⏳ 正在执行命令 · 已用时 20 秒"))
+        await ch.send(self._message("⏳ 正在执行命令 · 已用时 50 秒"))
+
+        assert ch._client.im.v1.message.create.call_count == 1
+        assert ch._client.im.v1.message.patch.call_count == 1
+        assert ch._tool_progress_messages["progress-1"] == "om_progress"
+
+    @pytest.mark.asyncio
+    async def test_thread_progress_replies_once_and_caches_reply_id(self):
+        ch = _make_channel()
+        ch._client.im.v1.message.reply.return_value = _mock_send_response("om_reply_progress")
+
+        await ch.send(self._message(
+            "⏳ 正在执行命令 · 已用时 20 秒",
+            thread_id="omt_thread",
+            root_id="om_root",
+        ))
+
+        ch._client.im.v1.message.reply.assert_called_once()
+        ch._client.im.v1.message.create.assert_not_called()
+        assert ch._tool_progress_messages["progress-1"] == "om_reply_progress"

@@ -322,6 +322,7 @@ class FeishuChannel(BaseChannel):
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
+        self._tool_progress_messages: dict[str, str] = {}
         # Staleness guard: drop messages created before this channel started
         # (restart replays) or older than the threshold (in-process redelivery).
         # Feishu's at-least-once delivery can re-push old events with a fresh
@@ -944,8 +945,10 @@ class FeishuChannel(BaseChannel):
             logger.debug("Feishu: error fetching parent message {}: {}", message_id, e)
             return None
 
-    def _reply_message_sync(self, parent_message_id: str, msg_type: str, content: str) -> bool:
-        """Reply to an existing Feishu message using the Reply API (synchronous)."""
+    def _reply_message_with_id_sync(
+        self, parent_message_id: str, msg_type: str, content: str,
+    ) -> str | None:
+        """Reply to a Feishu message and return the new message ID."""
         from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
         try:
             request = ReplyMessageRequest.builder() \
@@ -962,12 +965,17 @@ class FeishuChannel(BaseChannel):
                     "Failed to reply to Feishu message {}: code={}, msg={}, log_id={}",
                     parent_message_id, response.code, response.msg, response.get_log_id()
                 )
-                return False
-            logger.debug("Feishu reply sent to message {}", parent_message_id)
-            return True
+                return None
+            msg_id = getattr(response.data, "message_id", None)
+            logger.debug("Feishu reply sent to message {}: {}", parent_message_id, msg_id)
+            return msg_id
         except Exception as e:
             logger.error("Error replying to Feishu message {}: {}", parent_message_id, e)
-            return False
+            return None
+
+    def _reply_message_sync(self, parent_message_id: str, msg_type: str, content: str) -> bool:
+        """Reply to an existing Feishu message using the Reply API (synchronous)."""
+        return bool(self._reply_message_with_id_sync(parent_message_id, msg_type, content))
 
     def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str) -> str | None:
         """Send a single message and return the message_id on success."""
@@ -995,6 +1003,84 @@ class FeishuChannel(BaseChannel):
         except Exception as e:
             logger.error("Error sending Feishu {} message: {}", msg_type, e)
             return None
+
+    def _patch_message_sync(self, message_id: str, content: str) -> bool:
+        """Replace the text content of an existing Feishu message."""
+        from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+
+        try:
+            body = json.dumps({"text": content}, ensure_ascii=False)
+            request = PatchMessageRequest.builder() \
+                .message_id(message_id) \
+                .request_body(
+                    PatchMessageRequestBody.builder()
+                    .content(body)
+                    .build()
+                ).build()
+            response = self._client.im.v1.message.patch(request)
+            if not response.success():
+                logger.warning(
+                    "Failed to update Feishu progress message {}: code={}, msg={}",
+                    message_id, response.code, response.msg,
+                )
+                return False
+            return True
+        except Exception as e:
+            logger.warning("Error updating Feishu progress message {}: {}", message_id, e)
+            return False
+
+    async def _send_tool_progress(
+        self,
+        msg: OutboundMessage,
+        receive_id_type: str,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Create once, then update one progress message for an agent turn."""
+        progress_id = str(msg.metadata.get("_tool_progress_id") or "")
+        if not progress_id:
+            return
+
+        existing_message_id = self._tool_progress_messages.get(progress_id)
+        done = bool(msg.metadata.get("_tool_progress_done"))
+        if done:
+            if not existing_message_id:
+                return
+            self._tool_progress_messages.pop(progress_id, None)
+            await loop.run_in_executor(
+                None, self._patch_message_sync, existing_message_id, msg.content,
+            )
+            return
+
+        if existing_message_id:
+            await loop.run_in_executor(
+                None, self._patch_message_sync, existing_message_id, msg.content,
+            )
+            return
+
+        text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
+        parent_message_id = None
+        if msg.metadata.get("thread_id"):
+            parent_message_id = msg.metadata.get("root_id") or msg.metadata.get("message_id")
+
+        if parent_message_id:
+            sent_message_id = await loop.run_in_executor(
+                None,
+                self._reply_message_with_id_sync,
+                parent_message_id,
+                "text",
+                text_body,
+            )
+        else:
+            sent_message_id = await loop.run_in_executor(
+                None,
+                self._send_message_sync,
+                receive_id_type,
+                msg.chat_id,
+                "text",
+                text_body,
+            )
+        if sent_message_id:
+            self._tool_progress_messages[progress_id] = sent_message_id
 
     def _create_streaming_card_sync(
         self, receive_id_type: str, chat_id: str, reply_message_id: str | None = None
@@ -1174,6 +1260,10 @@ class FeishuChannel(BaseChannel):
         try:
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
+
+            if msg.metadata.get("_tool_progress_id"):
+                await self._send_tool_progress(msg, receive_id_type, loop)
+                return
 
             # Handle tool hint messages as code blocks in interactive cards.
             # These are progress-only messages and should bypass normal reply routing.
