@@ -42,6 +42,21 @@ class AgentHook:
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         pass
 
+    async def on_notice(self, context: AgentHookContext, message: str) -> None:
+        """Surface an out-of-band status note to the user (e.g. a model downgrade)."""
+        pass
+
+    async def on_tool_heartbeat(
+        self, context: AgentHookContext, *, elapsed: float, pending: list[str],
+    ) -> None:
+        """Report that *pending* tools are still running, *elapsed* seconds in.
+
+        Only fires while tool execution outlives ``_TOOL_HEARTBEAT_FIRST``, so
+        fast tools stay silent. Intervals back off (see ``AgentRunner``) to keep
+        a multi-minute job from flooding the channel.
+        """
+        pass
+
     async def after_iteration(self, context: AgentHookContext) -> None:
         pass
 

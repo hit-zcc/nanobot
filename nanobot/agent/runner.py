@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
+
+from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.tools.registry import ToolRegistry
@@ -16,6 +20,10 @@ _DEFAULT_MAX_ITERATIONS_MESSAGE = (
     "without completing the task. You can try breaking the task into smaller steps."
 )
 _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
+_DEFAULT_REFUSAL_MESSAGE = (
+    "The model declined to continue on this request (safety refusal). "
+    "Try rephrasing, breaking it into smaller steps, or using a different model."
+)
 
 
 @dataclass(slots=True)
@@ -31,6 +39,8 @@ class AgentRunSpec:
     reasoning_effort: str | None = None
     hook: AgentHook | None = None
     error_message: str | None = _DEFAULT_ERROR_MESSAGE
+    refusal_message: str | None = _DEFAULT_REFUSAL_MESSAGE
+    refusal_fallback_model: str | None = None
     max_iterations_message: str | None = None
     concurrent_tools: bool = False
     fail_on_tool_error: bool = False
@@ -52,6 +62,14 @@ class AgentRunResult:
 class AgentRunner:
     """Run a tool-capable LLM loop without product-layer concerns."""
 
+    # Tools report nothing while they run, so a single long exec used to leave
+    # the channel silent for its whole timeout (up to 10 minutes). Emit liveness
+    # notices instead, backing off so a long job doesn't flood the chat: first
+    # at 20s, then 30s, 45s, … capped at 2 minutes.
+    _TOOL_HEARTBEAT_FIRST = 20.0
+    _TOOL_HEARTBEAT_MAX = 120.0
+    _TOOL_HEARTBEAT_GROWTH = 1.5
+
     def __init__(self, provider: LLMProvider):
         self.provider = provider
 
@@ -64,6 +82,8 @@ class AgentRunner:
         error: str | None = None
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
+        current_model = spec.model
+        downgraded = False
 
         for iteration in range(spec.max_iterations):
             context = AgentHookContext(iteration=iteration, messages=messages)
@@ -71,7 +91,7 @@ class AgentRunner:
             kwargs: dict[str, Any] = {
                 "messages": messages,
                 "tools": spec.tools.get_definitions(),
-                "model": spec.model,
+                "model": current_model,
             }
             if spec.temperature is not None:
                 kwargs["temperature"] = spec.temperature
@@ -100,6 +120,71 @@ class AgentRunner:
             context.usage = usage
             context.tool_calls = list(response.tool_calls)
 
+            # A safety refusal truncates the turn (often mid-tool-call), so it
+            # must be handled BEFORE tool execution — otherwise a partial
+            # tool_use runs and the refusal signal is lost. First refusal:
+            # transparently retry on the stronger fallback model. If that model
+            # also refuses (or no fallback is set), surface the refusal message.
+            if response.finish_reason == "refusal":
+                if hook.wants_streaming():
+                    await hook.on_stream_end(context, resuming=True)
+                fallback = spec.refusal_fallback_model
+                if fallback and not downgraded and fallback != current_model:
+                    logger.warning(
+                        "Model {} refused (safety stop); retrying on {}",
+                        current_model, fallback,
+                    )
+                    downgraded = True
+                    current_model = fallback
+                    await hook.on_notice(
+                        context,
+                        f"⚠️ 这条被模型安全策略拒答了，正在用更强的模型（{fallback}）重试…",
+                    )
+                    await hook.after_iteration(context)
+                    continue
+                clean = hook.finalize_content(context, response.content)
+                final_content = clean or spec.refusal_message or _DEFAULT_REFUSAL_MESSAGE
+                stop_reason = "refusal"
+                context.final_content = final_content
+                context.stop_reason = stop_reason
+                await hook.after_iteration(context)
+                break
+
+            # Output hit the max_tokens ceiling in the middle of a tool call:
+            # streamed tool-call JSON is truncated, and partial-JSON parsing
+            # silently drops incomplete trailing fields (e.g. write_file losing
+            # its `content` argument). Executing such a call would corrupt data,
+            # so skip execution and feed the truncation back for a chunked retry.
+            if response.finish_reason == "length" and response.has_tool_calls:
+                if hook.wants_streaming():
+                    await hook.on_stream_end(context, resuming=True)
+                logger.warning(
+                    "Output truncated by max_tokens mid tool call ({}); skipping execution",
+                    ", ".join(tc.name for tc in response.tool_calls),
+                )
+                messages.append(build_assistant_message(
+                    response.content or "",
+                    tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
+                    reasoning_content=response.reasoning_content,
+                    thinking_blocks=response.thinking_blocks,
+                ))
+                for tc in response.tool_calls:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "name": tc.name,
+                        "content": (
+                            "Error: the model output hit the max_tokens limit in the "
+                            "middle of this tool call, so its arguments were truncated "
+                            "and it was NOT executed. Retry with a smaller payload — "
+                            "e.g. write the file in several chunks (a first write_file "
+                            "with the opening part, then append the rest via smaller "
+                            "edits/appends), or split the command into smaller steps."
+                        ),
+                    })
+                await hook.after_iteration(context)
+                continue
+
             if response.has_tool_calls:
                 if hook.wants_streaming():
                     await hook.on_stream_end(context, resuming=True)
@@ -114,7 +199,9 @@ class AgentRunner:
 
                 await hook.before_execute_tools(context)
 
-                results, new_events, fatal_error = await self._execute_tools(spec, response.tool_calls)
+                results, new_events, fatal_error = await self._execute_tools(
+                    spec, response.tool_calls, hook, context,
+                )
                 tool_events.extend(new_events)
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
@@ -174,21 +261,69 @@ class AgentRunner:
             tool_events=tool_events,
         )
 
+    async def _tool_heartbeat(
+        self,
+        hook: AgentHook,
+        context: AgentHookContext,
+        pending: dict[int, str],
+    ) -> None:
+        """Notify *hook* at backing-off intervals while *pending* tools run."""
+        started = time.monotonic()
+        delay = self._TOOL_HEARTBEAT_FIRST
+        while True:
+            await asyncio.sleep(delay)
+            if not pending:
+                return
+            try:
+                await hook.on_tool_heartbeat(
+                    context,
+                    elapsed=time.monotonic() - started,
+                    pending=sorted(set(pending.values())),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A broken progress channel must never stall tool execution.
+                logger.exception("Tool heartbeat hook failed; stopping notices")
+                return
+            delay = min(delay * self._TOOL_HEARTBEAT_GROWTH, self._TOOL_HEARTBEAT_MAX)
+
     async def _execute_tools(
         self,
         spec: AgentRunSpec,
         tool_calls: list[ToolCallRequest],
+        hook: AgentHook | None = None,
+        context: AgentHookContext | None = None,
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
-        if spec.concurrent_tools:
-            tool_results = await asyncio.gather(*(
-                self._run_tool(spec, tool_call)
-                for tool_call in tool_calls
-            ))
-        else:
-            tool_results = [
-                await self._run_tool(spec, tool_call)
-                for tool_call in tool_calls
-            ]
+        # Drop each entry as its tool settles so the heartbeat reports only what
+        # is genuinely still running.
+        pending = {i: tc.name for i, tc in enumerate(tool_calls)}
+
+        async def _run(index: int, tool_call: ToolCallRequest):
+            try:
+                return await self._run_tool(spec, tool_call)
+            finally:
+                pending.pop(index, None)
+
+        beat: asyncio.Task | None = None
+        if hook is not None and context is not None:
+            beat = asyncio.create_task(self._tool_heartbeat(hook, context, pending))
+        try:
+            if spec.concurrent_tools:
+                tool_results = await asyncio.gather(*(
+                    _run(i, tool_call)
+                    for i, tool_call in enumerate(tool_calls)
+                ))
+            else:
+                tool_results = [
+                    await _run(i, tool_call)
+                    for i, tool_call in enumerate(tool_calls)
+                ]
+        finally:
+            if beat is not None:
+                beat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await beat
 
         results: list[Any] = []
         events: list[dict[str, str]] = []

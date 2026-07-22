@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -48,6 +49,7 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
+    response_model: str | None = None  # actual model name echoed by the API
     
     @property
     def has_tool_calls(self) -> bool:
@@ -227,6 +229,26 @@ class LLMProvider(ABC):
         except Exception as exc:
             return LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
 
+    @staticmethod
+    def _emit_log(kw: dict[str, Any], response: "LLMResponse", t0: float, *, stream: bool) -> None:
+        """Fire-and-forget logging of an LLM call. Never raises."""
+        try:
+            from nanobot.providers.llm_logger import log_call as _log_llm_call
+            _log_llm_call(
+                model=kw.get("model"),
+                messages=kw.get("messages"),
+                tools=kw.get("tools"),
+                temperature=kw.get("temperature"),
+                max_tokens=kw.get("max_tokens"),
+                reasoning_effort=kw.get("reasoning_effort"),
+                tool_choice=kw.get("tool_choice"),
+                response=response,
+                duration_ms=(time.monotonic() - t0) * 1000,
+                stream=stream,
+            )
+        except Exception:
+            logger.debug("llm_logger emit failed", exc_info=True)
+
     async def chat_stream(
         self,
         messages: list[dict[str, Any]],
@@ -288,18 +310,23 @@ class LLMProvider(ABC):
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
             on_content_delta=on_content_delta,
         )
+        _t0 = time.monotonic()
 
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
             response = await self._safe_chat_stream(**kw)
 
             if response.finish_reason != "error":
+                self._emit_log(kw, response, _t0, stream=True)
                 return response
 
             if not self._is_transient_error(response.content):
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning("Non-transient LLM error with image content, retrying without images")
-                    return await self._safe_chat_stream(**{**kw, "messages": stripped})
+                    response = await self._safe_chat_stream(**{**kw, "messages": stripped})
+                    self._emit_log(kw, response, _t0, stream=True)
+                    return response
+                self._emit_log(kw, response, _t0, stream=True)
                 return response
 
             logger.warning(
@@ -309,7 +336,9 @@ class LLMProvider(ABC):
             )
             await asyncio.sleep(delay)
 
-        return await self._safe_chat_stream(**kw)
+        response = await self._safe_chat_stream(**kw)
+        self._emit_log(kw, response, _t0, stream=True)
+        return response
 
     async def chat_with_retry(
         self,
@@ -339,18 +368,23 @@ class LLMProvider(ABC):
             max_tokens=max_tokens, temperature=temperature,
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
         )
+        _t0 = time.monotonic()
 
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
             response = await self._safe_chat(**kw)
 
             if response.finish_reason != "error":
+                self._emit_log(kw, response, _t0, stream=False)
                 return response
 
             if not self._is_transient_error(response.content):
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning("Non-transient LLM error with image content, retrying without images")
-                    return await self._safe_chat(**{**kw, "messages": stripped})
+                    response = await self._safe_chat(**{**kw, "messages": stripped})
+                    self._emit_log(kw, response, _t0, stream=False)
+                    return response
+                self._emit_log(kw, response, _t0, stream=False)
                 return response
 
             logger.warning(
@@ -360,7 +394,9 @@ class LLMProvider(ABC):
             )
             await asyncio.sleep(delay)
 
-        return await self._safe_chat(**kw)
+        response = await self._safe_chat(**kw)
+        self._emit_log(kw, response, _t0, stream=False)
+        return response
 
     @abstractmethod
     def get_default_model(self) -> str:

@@ -30,6 +30,7 @@ class SubagentManager:
         workspace: Path,
         bus: MessageBus,
         model: str | None = None,
+        max_iterations: int = 80,
         web_search_config: "WebSearchConfig | None" = None,
         web_proxy: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
@@ -41,6 +42,7 @@ class SubagentManager:
         self.workspace = workspace
         self.bus = bus
         self.model = model or provider.get_default_model()
+        self.max_iterations = max_iterations
         self.web_search_config = web_search_config or WebSearchConfig()
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
@@ -125,9 +127,12 @@ class SubagentManager:
                 initial_messages=messages,
                 tools=tools,
                 model=self.model,
-                max_iterations=15,
+                max_iterations=self.max_iterations,
                 hook=_SubagentHook(),
-                max_iterations_message="Task completed but no final response was generated.",
+                max_iterations_message=(
+                    "Task did not complete before reaching the maximum number of "
+                    "tool call iterations ({max_iterations})."
+                ),
                 error_message=None,
                 fail_on_tool_error=True,
             ))
@@ -147,6 +152,16 @@ class SubagentManager:
                     label,
                     task,
                     result.error or "Error: subagent execution failed.",
+                    origin,
+                    "error",
+                )
+                return
+            if result.stop_reason == "max_iterations":
+                await self._announce_result(
+                    task_id,
+                    label,
+                    task,
+                    result.final_content,
                     origin,
                     "error",
                 )

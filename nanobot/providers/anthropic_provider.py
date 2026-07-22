@@ -404,10 +404,32 @@ class AnthropicProvider(LLMProvider):
             if block.type == "text":
                 content_parts.append(block.text)
             elif block.type == "tool_use":
+                args = block.input
+                if not isinstance(args, dict):
+                    # Streamed tool input can surface as a raw/partial JSON
+                    # string. Recover from the SDK's accumulated byte buffer
+                    # (set during streaming) via json_repair instead of
+                    # silently dropping the arguments.
+                    raw: Any = getattr(block, "__json_buf", b"") or (
+                        args if isinstance(args, str) else ""
+                    )
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8", "replace")
+                    try:
+                        repaired = json_repair.loads(raw) if raw else {}
+                    except Exception:
+                        repaired = {}
+                    args = repaired if isinstance(repaired, dict) else {}
+                    if not args:
+                        logger.warning(
+                            "tool_use block {} ({}) had non-dict input that could "
+                            "not be recovered; arguments dropped",
+                            block.id, block.name,
+                        )
                 tool_calls.append(ToolCallRequest(
                     id=block.id,
                     name=block.name,
-                    arguments=block.input if isinstance(block.input, dict) else {},
+                    arguments=args,
                 ))
             elif block.type == "thinking":
                 thinking_blocks.append({
@@ -437,6 +459,7 @@ class AnthropicProvider(LLMProvider):
             finish_reason=finish_reason,
             usage=usage,
             thinking_blocks=thinking_blocks or None,
+            response_model=getattr(response, "model", None),
         )
 
     # ------------------------------------------------------------------

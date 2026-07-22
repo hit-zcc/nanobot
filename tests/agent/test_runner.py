@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -229,6 +230,328 @@ async def test_runner_returns_max_iterations_fallback():
 
 
 @pytest.mark.asyncio
+async def test_runner_surfaces_refusal_message_when_content_empty():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content=None,
+        tool_calls=[],
+        finish_reason="refusal",
+        usage={},
+    ))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        refusal_message="blocked, try again differently",
+    ))
+
+    assert result.stop_reason == "refusal"
+    assert result.final_content == "blocked, try again differently"
+
+
+@pytest.mark.asyncio
+async def test_runner_refusal_auto_downgrades_to_fallback_model():
+    from nanobot.agent.hook import AgentHook, AgentHookContext
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    models_used: list[str] = []
+    notices: list[str] = []
+    call_count = {"n": 0}
+
+    async def chat_with_retry(*, model, **kwargs):
+        models_used.append(model)
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return LLMResponse(content=None, tool_calls=[], finish_reason="refusal", usage={})
+        return LLMResponse(content="recovered answer", tool_calls=[], finish_reason="stop", usage={})
+
+    provider = MagicMock()
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    class NoticeHook(AgentHook):
+        async def on_notice(self, context: AgentHookContext, message: str) -> None:
+            notices.append(message)
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="primary-model",
+        max_iterations=3,
+        hook=NoticeHook(),
+        refusal_fallback_model="fallback-model",
+    ))
+
+    assert result.stop_reason == "completed"
+    assert result.final_content == "recovered answer"
+    assert models_used == ["primary-model", "fallback-model"]
+    assert len(notices) == 1 and "fallback-model" in notices[0]
+
+
+@pytest.mark.asyncio
+async def test_runner_refusal_surfaces_message_when_fallback_also_refuses():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    models_used: list[str] = []
+
+    async def chat_with_retry(*, model, **kwargs):
+        models_used.append(model)
+        return LLMResponse(content=None, tool_calls=[], finish_reason="refusal", usage={})
+
+    provider = MagicMock()
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="primary-model",
+        max_iterations=3,
+        refusal_message="blocked for good",
+        refusal_fallback_model="fallback-model",
+    ))
+
+    assert result.stop_reason == "refusal"
+    assert result.final_content == "blocked for good"
+    # Downgrades exactly once, then gives up rather than looping forever.
+    assert models_used == ["primary-model", "fallback-model"]
+
+
+@pytest.mark.asyncio
+async def test_runner_refusal_keeps_partial_content_when_present():
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content="here is the partial answer before it stopped",
+        tool_calls=[],
+        finish_reason="refusal",
+        usage={},
+    ))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        refusal_message="blocked",
+    ))
+
+    assert result.stop_reason == "refusal"
+    assert result.final_content == "here is the partial answer before it stopped"
+
+
+@pytest.mark.asyncio
+async def test_runner_heartbeats_while_a_slow_tool_runs(monkeypatch):
+    from nanobot.agent.hook import AgentHook
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    monkeypatch.setattr(AgentRunner, "_TOOL_HEARTBEAT_FIRST", 0.01)
+    monkeypatch.setattr(AgentRunner, "_TOOL_HEARTBEAT_MAX", 0.01)
+    monkeypatch.setattr(AgentRunner, "_TOOL_HEARTBEAT_GROWTH", 1.0)
+
+    beats: list[tuple[float, list[str]]] = []
+
+    class _Hook(AgentHook):
+        async def on_tool_heartbeat(self, context, *, elapsed, pending):
+            beats.append((elapsed, list(pending)))
+
+    provider = MagicMock()
+    call_count = {"n": 0}
+
+    async def chat_with_retry(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(id="c1", name="exec", arguments={})],
+                usage={},
+            )
+        return LLMResponse(content="done", tool_calls=[], usage={})
+
+    provider.chat_with_retry = chat_with_retry
+
+    async def slow_tool(*args, **kwargs):
+        await asyncio.sleep(0.2)
+        return "ok"
+
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = slow_tool
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "go"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        hook=_Hook(),
+    ))
+
+    assert result.final_content == "done"
+    assert beats, "a slow tool must emit liveness notices"
+    assert all(pending == ["exec"] for _, pending in beats)
+    assert beats[0][0] > 0
+
+
+@pytest.mark.asyncio
+async def test_runner_stays_silent_for_fast_tools():
+    """The grace period must keep quick tools from announcing themselves."""
+    from nanobot.agent.hook import AgentHook
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    beats: list[float] = []
+
+    class _Hook(AgentHook):
+        async def on_tool_heartbeat(self, context, *, elapsed, pending):
+            beats.append(elapsed)
+
+    provider = MagicMock()
+    call_count = {"n": 0}
+
+    async def chat_with_retry(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(id="c1", name="read_file", arguments={})],
+                usage={},
+            )
+        return LLMResponse(content="done", tool_calls=[], usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="instant")
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "go"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        hook=_Hook(),
+    ))
+
+    assert result.final_content == "done"
+    assert beats == []
+
+
+@pytest.mark.asyncio
+async def test_loop_tool_heartbeat_reaches_progress_channel(tmp_path, monkeypatch):
+    """Heartbeats must ride the plain progress channel, not the tool_hint one."""
+    from nanobot.agent.runner import AgentRunner
+
+    monkeypatch.setattr(AgentRunner, "_TOOL_HEARTBEAT_FIRST", 0.01)
+    monkeypatch.setattr(AgentRunner, "_TOOL_HEARTBEAT_MAX", 0.01)
+    monkeypatch.setattr(AgentRunner, "_TOOL_HEARTBEAT_GROWTH", 1.0)
+
+    loop = _make_loop(tmp_path)
+    progress: list[tuple[str, bool]] = []
+    call_count = {"n": 0}
+
+    async def chat_with_retry(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(id="c1", name="exec", arguments={"command": "sleep"})],
+                usage={},
+            )
+        return LLMResponse(content="done", tool_calls=[], usage={})
+
+    loop.provider.chat_with_retry = chat_with_retry
+    loop.tools.get_definitions = MagicMock(return_value=[])
+
+    async def slow_tool(*args, **kwargs):
+        await asyncio.sleep(0.2)
+        return "ok"
+
+    loop.tools.execute = slow_tool
+
+    async def on_progress(msg, *, tool_hint=False):
+        progress.append((msg, tool_hint))
+
+    final_content, _, _ = await loop._run_agent_loop([], on_progress=on_progress)
+
+    assert final_content == "done"
+    beats = [m for m, hint in progress if not hint and "仍在执行" in m]
+    assert beats, f"expected a heartbeat on the plain progress channel, got {progress}"
+    assert "exec" in beats[0]
+
+
+def test_loop_refusal_fallback_model_derivation(tmp_path):
+    loop = _make_loop(tmp_path)
+    loop.model = "claude-oauth/claude-fable-5"
+    assert loop._refusal_fallback_model() == "claude-oauth/claude-opus-4-8"
+    loop.model = "claude-fable-5"
+    assert loop._refusal_fallback_model() == "claude-opus-4-8"
+    # Already on Opus 4.8 → no fallback.
+    loop.model = "claude-oauth/claude-opus-4-8"
+    assert loop._refusal_fallback_model() is None
+    # Non-Claude provider → no fallback.
+    loop.model = "azure/gpt-4o"
+    assert loop._refusal_fallback_model() is None
+
+
+@pytest.mark.asyncio
+async def test_loop_refusal_auto_downgrades_and_notifies(tmp_path):
+    loop = _make_loop(tmp_path)
+    loop.model = "claude-oauth/claude-fable-5"
+    models_used: list[str] = []
+    notices: list[str] = []
+    call_count = {"n": 0}
+
+    async def chat_with_retry(*, model, **kwargs):
+        models_used.append(model)
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return LLMResponse(content=None, tool_calls=[], finish_reason="refusal", usage={})
+        return LLMResponse(content="recovered", tool_calls=[], finish_reason="stop", usage={})
+
+    loop.provider.chat_with_retry = chat_with_retry
+    loop.tools.get_definitions = MagicMock(return_value=[])
+
+    async def on_progress(msg, *, tool_hint=False):
+        notices.append(msg)
+
+    final_content, _, _ = await loop._run_agent_loop([], on_progress=on_progress)
+
+    assert final_content == "recovered"
+    assert models_used == ["claude-oauth/claude-fable-5", "claude-oauth/claude-opus-4-8"]
+    assert any("claude-opus-4-8" in n for n in notices)
+
+
+@pytest.mark.asyncio
+async def test_loop_refusal_returns_chinese_message(tmp_path):
+    loop = _make_loop(tmp_path)
+    loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content=None,
+        tool_calls=[],
+        finish_reason="refusal",
+        usage={},
+    ))
+    loop.tools.get_definitions = MagicMock(return_value=[])
+
+    final_content, _, _ = await loop._run_agent_loop([])
+
+    assert "安全限制" in final_content
+    assert final_content != "I've completed processing but have no response to give."
+
+
+@pytest.mark.asyncio
 async def test_runner_returns_structured_tool_error():
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
 
@@ -308,7 +631,7 @@ async def test_loop_stream_filter_handles_think_only_prefix_without_crashing(tmp
 
 
 @pytest.mark.asyncio
-async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, monkeypatch):
+async def test_subagent_max_iterations_announces_failure(tmp_path, monkeypatch):
     from nanobot.agent.subagent import SubagentManager
     from nanobot.bus.queue import MessageBus
 
@@ -319,7 +642,7 @@ async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, mon
         content="working",
         tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={})],
     ))
-    mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+    mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus, max_iterations=2)
     mgr._announce_result = AsyncMock()
 
     async def fake_execute(self, name, arguments):
@@ -331,5 +654,62 @@ async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, mon
 
     mgr._announce_result.assert_awaited_once()
     args = mgr._announce_result.await_args.args
-    assert args[3] == "Task completed but no final response was generated."
-    assert args[5] == "ok"
+    assert args[3] == (
+        "Task did not complete before reaching the maximum number of "
+        "tool call iterations (2)."
+    )
+    assert args[5] == "error"
+
+
+@pytest.mark.asyncio
+async def test_runner_skips_tool_calls_truncated_by_max_tokens():
+    """finish_reason=length + tool_calls => do NOT execute (args may be
+    silently truncated, e.g. write_file losing `content`); feed an error
+    back so the model retries with smaller payloads."""
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    captured_second_call: list[dict] = []
+    call_count = {"n": 0}
+
+    async def chat_with_retry(*, messages, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Truncated mid-stream: content argument was dropped by
+            # partial-JSON parsing, finish_reason is "length".
+            return LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(
+                    id="call_trunc", name="write_file",
+                    arguments={"path": "big.md"},
+                )],
+                finish_reason="length",
+                usage={"prompt_tokens": 5, "completion_tokens": 8192},
+            )
+        captured_second_call[:] = messages
+        return LLMResponse(content="recovered", tool_calls=[], usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="should not run")
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "write a huge file"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+    ))
+
+    # The truncated call must never reach tool execution.
+    tools.execute.assert_not_awaited()
+    assert result.final_content == "recovered"
+    assert result.tools_used == []
+
+    # The model got the assistant tool_call message plus an error tool result.
+    tool_msgs = [m for m in captured_second_call if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["tool_call_id"] == "call_trunc"
+    assert "max_tokens" in tool_msgs[0]["content"]
+    assert "NOT executed" in tool_msgs[0]["content"]

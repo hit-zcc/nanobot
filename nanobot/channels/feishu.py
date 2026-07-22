@@ -996,8 +996,14 @@ class FeishuChannel(BaseChannel):
             logger.error("Error sending Feishu {} message: {}", msg_type, e)
             return None
 
-    def _create_streaming_card_sync(self, receive_id_type: str, chat_id: str) -> str | None:
-        """Create a CardKit streaming card, send it to chat, return card_id."""
+    def _create_streaming_card_sync(
+        self, receive_id_type: str, chat_id: str, reply_message_id: str | None = None
+    ) -> str | None:
+        """Create a CardKit streaming card, send it to chat, return card_id.
+
+        When reply_message_id is given, the card message is sent as a reply so it
+        quotes the user's original message; otherwise it is sent as a new message.
+        """
         from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
         card_json = {
             "schema": "2.0",
@@ -1017,11 +1023,19 @@ class FeishuChannel(BaseChannel):
                 return None
             card_id = getattr(response.data, "card_id", None)
             if card_id:
-                message_id = self._send_message_sync(
-                    receive_id_type, chat_id, "interactive",
-                    json.dumps({"type": "card", "data": {"card_id": card_id}}),
-                )
-                if message_id:
+                card_content = json.dumps({"type": "card", "data": {"card_id": card_id}})
+                if reply_message_id:
+                    sent = self._reply_message_sync(reply_message_id, "interactive", card_content)
+                    if not sent:
+                        # Reply failed (e.g. original message gone); fall back to plain send.
+                        sent = bool(self._send_message_sync(
+                            receive_id_type, chat_id, "interactive", card_content,
+                        ))
+                else:
+                    sent = bool(self._send_message_sync(
+                        receive_id_type, chat_id, "interactive", card_content,
+                    ))
+                if sent:
                     return card_id
                 logger.warning("Created streaming card {} but failed to send it to {}", card_id, chat_id)
             return None
@@ -1088,6 +1102,15 @@ class FeishuChannel(BaseChannel):
         loop = asyncio.get_running_loop()
         rid_type = "chat_id" if chat_id.startswith("oc_") else "open_id"
 
+        # Decide whether the streaming card should quote the user's message.
+        # Mirrors the routing in send(): explicit reply_to_message config, or an
+        # implicit thread reply to keep topic-group context in-thread.
+        reply_message_id: str | None = None
+        if self.config.reply_to_message and meta.get("message_id"):
+            reply_message_id = meta.get("message_id")
+        elif meta.get("thread_id"):
+            reply_message_id = meta.get("root_id") or meta.get("message_id") or None
+
         # --- stream end: final update or fallback ---
         if meta.get("_stream_end"):
             buf = self._stream_bufs.pop(chat_id, None)
@@ -1104,8 +1127,17 @@ class FeishuChannel(BaseChannel):
                     None, self._close_streaming_mode_sync, buf.card_id, buf.sequence,
                 )
             else:
+                first_chunk = True
                 for chunk in self._split_elements_by_table_limit(self._build_card_elements(buf.text)):
                     card = json.dumps({"config": {"wide_screen_mode": True}, "elements": chunk}, ensure_ascii=False)
+                    if reply_message_id and first_chunk:
+                        first_chunk = False
+                        ok = await loop.run_in_executor(
+                            None, self._reply_message_sync, reply_message_id, "interactive", card,
+                        )
+                        if ok:
+                            continue
+                        # Fall back to a plain send if the reply fails.
                     await loop.run_in_executor(None, self._send_message_sync, rid_type, chat_id, "interactive", card)
             return
 
@@ -1120,7 +1152,9 @@ class FeishuChannel(BaseChannel):
 
         now = time.monotonic()
         if buf.card_id is None:
-            card_id = await loop.run_in_executor(None, self._create_streaming_card_sync, rid_type, chat_id)
+            card_id = await loop.run_in_executor(
+                None, self._create_streaming_card_sync, rid_type, chat_id, reply_message_id,
+            )
             if card_id:
                 buf.card_id = card_id
                 buf.sequence = 1

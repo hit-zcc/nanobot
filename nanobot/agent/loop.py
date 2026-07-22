@@ -57,7 +57,8 @@ class AgentLoop:
         provider: LLMProvider,
         workspace: Path,
         model: str | None = None,
-        max_iterations: int = 40,
+        max_iterations: int = 80,
+        max_subagent_iterations: int = 80,
         context_window_tokens: int = 65_536,
         web_search_config: WebSearchConfig | None = None,
         web_proxy: str | None = None,
@@ -95,6 +96,7 @@ class AgentLoop:
             workspace=workspace,
             bus=bus,
             model=self.model,
+            max_iterations=max_subagent_iterations,
             web_search_config=self.web_search_config,
             web_proxy=web_proxy,
             exec_config=self.exec_config,
@@ -189,6 +191,24 @@ class AgentLoop:
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
 
+    def _refusal_fallback_model(self) -> str | None:
+        """Stronger model to retry on when the primary model safety-refuses.
+
+        Opus 4.8 lacks the extra Fable/Mythos safety layer, so it recovers most
+        spurious refusals. Only applies to Anthropic-family models; returns None
+        when already on Opus 4.8 or on a non-Claude provider.
+        """
+        model = self.model or ""
+        prefix, _, name = model.rpartition("/")
+        target = name or model
+        markers = ("claude", "fable", "mythos", "opus", "sonnet", "haiku")
+        if not any(m in target for m in markers):
+            return None
+        if "opus-4-8" in target:
+            return None
+        fallback = "claude-opus-4-8"
+        return f"{prefix}/{fallback}" if prefix else fallback
+
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
         """Remove <think>…</think> blocks that some models embed in content."""
@@ -263,6 +283,21 @@ class AgentLoop:
                     logger.info("Tool call: {}({})", tc.name, args_str[:200])
                 loop_self._set_tool_context(channel, chat_id, message_id)
 
+            async def on_notice(self, context: AgentHookContext, message: str) -> None:
+                if on_progress:
+                    await on_progress(message)
+
+            async def on_tool_heartbeat(
+                self, context: AgentHookContext, *, elapsed: float, pending: list[str],
+            ) -> None:
+                # Sent as plain progress (not tool_hint) on purpose: this is a
+                # liveness signal for a job already running long, so it must not
+                # be gated behind sendToolHints.
+                if on_progress:
+                    await on_progress(
+                        f"⏳ 仍在执行 {'、'.join(pending)}（已 {int(elapsed)}s）"
+                    )
+
             def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
                 return loop_self._strip_think(content)
 
@@ -273,6 +308,11 @@ class AgentLoop:
             max_iterations=self.max_iterations,
             hook=_LoopHook(),
             error_message="Sorry, I encountered an error calling the AI model.",
+            refusal_message=(
+                "这条请求触发了模型的安全限制，我没法继续生成。"
+                "可以换个说法、拆成几步分开发，或改用其他模型再试。"
+            ),
+            refusal_fallback_model=loop_self._refusal_fallback_model(),
             concurrent_tools=True,
         ))
         self._last_usage = result.usage
@@ -280,6 +320,8 @@ class AgentLoop:
             logger.warning("Max iterations ({}) reached", self.max_iterations)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
+        elif result.stop_reason == "refusal":
+            logger.warning("LLM refused (safety stop): {}", (result.final_content or "")[:200])
         return result.final_content, result.tools_used, result.messages
 
     async def run(self) -> None:
@@ -380,6 +422,15 @@ class AgentLoop:
                     stream_base_id = f"{msg.session_key}:{time.time_ns()}"
                     stream_segment = 0
 
+                    # Carry the original message's reply-routing keys into the
+                    # stream deltas so channels that quote/reply (e.g. Feishu
+                    # streaming cards) can target the user's original message.
+                    reply_meta = {
+                        k: msg.metadata[k]
+                        for k in ("message_id", "root_id", "thread_id")
+                        if msg.metadata.get(k)
+                    }
+
                     def _current_stream_id() -> str:
                         return f"{stream_base_id}:{stream_segment}"
 
@@ -388,6 +439,7 @@ class AgentLoop:
                             channel=msg.channel, chat_id=msg.chat_id,
                             content=delta,
                             metadata={
+                                **reply_meta,
                                 "_stream_delta": True,
                                 "_stream_id": _current_stream_id(),
                             },
@@ -523,10 +575,26 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
+        # Track whether any visible content was actually streamed this turn.
+        # A turn can end with zero deltas (e.g. the model only made tool calls
+        # and its final message was empty) — in that case the final outbound
+        # message must NOT be marked _streamed, or the channel drops it and the
+        # user gets no reply at all.
+        streamed_any = False
+        wrapped_on_stream = None
+        if on_stream is not None:
+            _orig_on_stream = on_stream
+
+            async def wrapped_on_stream(delta: str) -> None:
+                nonlocal streamed_any
+                if delta.strip():
+                    streamed_any = True
+                await _orig_on_stream(delta)
+
         final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
-            on_stream=on_stream,
+            on_stream=wrapped_on_stream,
             on_stream_end=on_stream_end,
             channel=msg.channel, chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
@@ -546,7 +614,7 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = dict(msg.metadata or {})
-        if on_stream is not None:
+        if streamed_any:
             meta["_streamed"] = True
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
