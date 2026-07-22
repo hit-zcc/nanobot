@@ -1004,20 +1004,21 @@ class FeishuChannel(BaseChannel):
             logger.error("Error sending Feishu {} message: {}", msg_type, e)
             return None
 
-    def _patch_message_sync(self, message_id: str, content: str) -> bool:
+    def _update_message_sync(self, message_id: str, content: str) -> bool:
         """Replace the text content of an existing Feishu message."""
-        from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+        from lark_oapi.api.im.v1 import UpdateMessageRequest, UpdateMessageRequestBody
 
         try:
             body = json.dumps({"text": content}, ensure_ascii=False)
-            request = PatchMessageRequest.builder() \
+            request = UpdateMessageRequest.builder() \
                 .message_id(message_id) \
                 .request_body(
-                    PatchMessageRequestBody.builder()
+                    UpdateMessageRequestBody.builder()
+                    .msg_type("text")
                     .content(body)
                     .build()
                 ).build()
-            response = self._client.im.v1.message.patch(request)
+            response = self._client.im.v1.message.update(request)
             if not response.success():
                 logger.warning(
                     "Failed to update Feishu progress message {}: code={}, msg={}",
@@ -1047,13 +1048,13 @@ class FeishuChannel(BaseChannel):
                 return
             self._tool_progress_messages.pop(progress_id, None)
             await loop.run_in_executor(
-                None, self._patch_message_sync, existing_message_id, msg.content,
+                None, self._update_message_sync, existing_message_id, msg.content,
             )
             return
 
         if existing_message_id:
             await loop.run_in_executor(
-                None, self._patch_message_sync, existing_message_id, msg.content,
+                None, self._update_message_sync, existing_message_id, msg.content,
             )
             return
 

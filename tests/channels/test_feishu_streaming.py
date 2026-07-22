@@ -1,4 +1,5 @@
 """Tests for Feishu streaming (send_delta) via CardKit streaming API."""
+import json
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -275,17 +276,23 @@ class TestToolProgressMessages:
         )
 
     @pytest.mark.asyncio
-    async def test_creates_once_then_patches_and_completes(self):
+    async def test_creates_once_then_updates_and_completes(self):
         ch = _make_channel()
         ch._client.im.v1.message.create.return_value = _mock_send_response("om_progress")
-        ch._client.im.v1.message.patch.return_value = _mock_content_response()
+        ch._client.im.v1.message.update.return_value = _mock_content_response()
 
         await ch.send(self._message("⏳ 正在执行命令 · 已用时 20 秒"))
         await ch.send(self._message("⏳ 正在执行命令 · 已用时 50 秒"))
         await ch.send(self._message("✅ 执行命令完成 · 共用时 1 分 2 秒", done=True))
 
         assert ch._client.im.v1.message.create.call_count == 1
-        assert ch._client.im.v1.message.patch.call_count == 2
+        assert ch._client.im.v1.message.update.call_count == 2
+        update_request = ch._client.im.v1.message.update.call_args_list[0].args[0]
+        assert update_request.body.msg_type == "text"
+        assert json.loads(update_request.body.content) == {
+            "text": "⏳ 正在执行命令 · 已用时 50 秒"
+        }
+        ch._client.im.v1.message.patch.assert_not_called()
         assert "progress-1" not in ch._tool_progress_messages
 
     @pytest.mark.asyncio
@@ -295,19 +302,19 @@ class TestToolProgressMessages:
         await ch.send(self._message("✅ 执行命令完成 · 共用时 1 秒", done=True))
 
         ch._client.im.v1.message.create.assert_not_called()
-        ch._client.im.v1.message.patch.assert_not_called()
+        ch._client.im.v1.message.update.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_patch_failure_does_not_create_replacement(self):
+    async def test_update_failure_does_not_create_replacement(self):
         ch = _make_channel()
         ch._client.im.v1.message.create.return_value = _mock_send_response("om_progress")
-        ch._client.im.v1.message.patch.return_value = _mock_content_response(False)
+        ch._client.im.v1.message.update.return_value = _mock_content_response(False)
 
         await ch.send(self._message("⏳ 正在执行命令 · 已用时 20 秒"))
         await ch.send(self._message("⏳ 正在执行命令 · 已用时 50 秒"))
 
         assert ch._client.im.v1.message.create.call_count == 1
-        assert ch._client.im.v1.message.patch.call_count == 1
+        assert ch._client.im.v1.message.update.call_count == 1
         assert ch._tool_progress_messages["progress-1"] == "om_progress"
 
     @pytest.mark.asyncio
