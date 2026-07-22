@@ -50,6 +50,18 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 16_000
+    _TOOL_DISPLAY_NAMES = {
+        "exec": "执行命令",
+        "read_file": "读取文件",
+        "write_file": "写入文件",
+        "edit_file": "编辑文件",
+        "list_dir": "浏览目录",
+        "web_search": "搜索网页",
+        "web_fetch": "获取网页",
+        "message": "发送消息",
+        "spawn": "启动子任务",
+        "cron": "管理定时任务",
+    }
 
     def __init__(
         self,
@@ -228,10 +240,41 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        total = max(0, int(seconds))
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        parts = []
+        if hours:
+            parts.append(f"{hours} 小时")
+        if minutes:
+            parts.append(f"{minutes} 分")
+        if secs or not parts:
+            parts.append(f"{secs} 秒")
+        return " ".join(parts)
+
+    @classmethod
+    def _format_tool_names(cls, names: list[str]) -> list[str]:
+        return [cls._TOOL_DISPLAY_NAMES.get(name, f"`{name}`") for name in names]
+
+    @classmethod
+    def _format_tool_progress(cls, names: list[str], elapsed: float, *, done: bool) -> str:
+        labels = cls._format_tool_names(names)
+        duration = cls._format_duration(elapsed)
+        if done:
+            subject = labels[0] if len(labels) == 1 else "、".join(labels)
+            suffix = "完成" if len(labels) == 1 else "已完成"
+            return f"✅ {subject}{suffix} · 共用时 {duration}"
+        if len(labels) == 1:
+            return f"⏳ 正在{labels[0]} · 已用时 {duration}"
+        return f"⏳ 正在处理：{'、'.join(labels)} · 已用时 {duration}"
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        on_tool_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         *,
@@ -251,6 +294,9 @@ class AgentLoop:
         class _LoopHook(AgentHook):
             def __init__(self) -> None:
                 self._stream_buf = ""
+                self._tool_progress_id = f"tool-progress:{time.time_ns()}"
+                self._tool_progress_started: float | None = None
+                self._tool_progress_tools: list[str] = []
 
             def wants_streaming(self) -> bool:
                 return on_stream is not None
@@ -293,20 +339,41 @@ class AgentLoop:
                 # Sent as plain progress (not tool_hint) on purpose: this is a
                 # liveness signal for a job already running long, so it must not
                 # be gated behind sendToolHints.
-                if on_progress:
-                    await on_progress(
-                        f"⏳ 仍在执行 {'、'.join(pending)}（已 {int(elapsed)}s）"
+                if self._tool_progress_started is None:
+                    self._tool_progress_started = time.monotonic() - elapsed
+                for name in pending:
+                    if name not in self._tool_progress_tools:
+                        self._tool_progress_tools.append(name)
+                total_elapsed = time.monotonic() - self._tool_progress_started
+                content = loop_self._format_tool_progress(pending, total_elapsed, done=False)
+                if on_tool_progress:
+                    await on_tool_progress(
+                        content, progress_id=self._tool_progress_id, done=False,
                     )
+                elif on_progress:
+                    await on_progress(content)
+
+            async def finish_tool_progress(self) -> None:
+                if self._tool_progress_started is None or not on_tool_progress:
+                    return
+                elapsed = time.monotonic() - self._tool_progress_started
+                content = loop_self._format_tool_progress(
+                    self._tool_progress_tools, elapsed, done=True,
+                )
+                await on_tool_progress(
+                    content, progress_id=self._tool_progress_id, done=True,
+                )
 
             def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
                 return loop_self._strip_think(content)
 
+        hook = _LoopHook()
         result = await self.runner.run(AgentRunSpec(
             initial_messages=initial_messages,
             tools=self.tools,
             model=self.model,
             max_iterations=self.max_iterations,
-            hook=_LoopHook(),
+            hook=hook,
             error_message="Sorry, I encountered an error calling the AI model.",
             refusal_message=(
                 "这条请求触发了模型的安全限制，我没法继续生成。"
@@ -315,6 +382,7 @@ class AgentLoop:
             refusal_fallback_model=loop_self._refusal_fallback_model(),
             concurrent_tools=True,
         ))
+        await hook.finish_tool_progress()
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
@@ -575,6 +643,21 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
+        async def _bus_tool_progress(
+            content: str, *, progress_id: str, done: bool,
+        ) -> None:
+            if msg.channel != "feishu":
+                if not done:
+                    await _bus_progress(content)
+                return
+            meta = dict(msg.metadata or {})
+            meta["_progress"] = True
+            meta["_tool_progress_id"] = progress_id
+            meta["_tool_progress_done"] = done
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
+            ))
+
         # Track whether any visible content was actually streamed this turn.
         # A turn can end with zero deltas (e.g. the model only made tool calls
         # and its final message was empty) — in that case the final outbound
@@ -594,6 +677,7 @@ class AgentLoop:
         final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
+            on_tool_progress=_bus_tool_progress if on_progress is None else None,
             on_stream=wrapped_on_stream,
             on_stream_end=on_stream_end,
             channel=msg.channel, chat_id=msg.chat_id,

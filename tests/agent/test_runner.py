@@ -487,9 +487,66 @@ async def test_loop_tool_heartbeat_reaches_progress_channel(tmp_path, monkeypatc
     final_content, _, _ = await loop._run_agent_loop([], on_progress=on_progress)
 
     assert final_content == "done"
-    beats = [m for m, hint in progress if not hint and "仍在执行" in m]
+    beats = [m for m, hint in progress if not hint and "已用时" in m]
     assert beats, f"expected a heartbeat on the plain progress channel, got {progress}"
-    assert "exec" in beats[0]
+    assert "执行命令" in beats[0]
+
+
+def test_tool_progress_formatting(tmp_path):
+    loop = _make_loop(tmp_path)
+
+    assert loop._format_duration(20) == "20 秒"
+    assert loop._format_duration(263) == "4 分 23 秒"
+    assert loop._format_duration(3661) == "1 小时 1 分 1 秒"
+    assert loop._format_tool_names(["exec", "read_file"]) == ["执行命令", "读取文件"]
+    assert loop._format_tool_names(["custom_tool"]) == ["`custom_tool`"]
+
+
+@pytest.mark.asyncio
+async def test_loop_tool_progress_has_one_id_and_completes(tmp_path, monkeypatch):
+    from nanobot.agent.runner import AgentRunner
+
+    monkeypatch.setattr(AgentRunner, "_TOOL_HEARTBEAT_FIRST", 0.01)
+    monkeypatch.setattr(AgentRunner, "_TOOL_HEARTBEAT_MAX", 0.01)
+    monkeypatch.setattr(AgentRunner, "_TOOL_HEARTBEAT_GROWTH", 1.0)
+
+    loop = _make_loop(tmp_path)
+    call_count = {"n": 0}
+
+    async def chat_with_retry(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(id="c1", name="exec", arguments={})],
+                usage={},
+            )
+        return LLMResponse(content="done", tool_calls=[], usage={})
+
+    loop.provider.chat_with_retry = chat_with_retry
+    loop.tools.get_definitions = MagicMock(return_value=[])
+
+    async def slow_tool(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        return "ok"
+
+    loop.tools.execute = slow_tool
+    events: list[tuple[str, str, bool]] = []
+
+    async def on_tool_progress(content: str, *, progress_id: str, done: bool) -> None:
+        events.append((content, progress_id, done))
+
+    final_content, _, _ = await loop._run_agent_loop(
+        [], on_tool_progress=on_tool_progress,
+    )
+
+    assert final_content == "done"
+    assert events[0][2] is False
+    assert events[-1][2] is True
+    assert events[0][1]
+    assert {progress_id for _, progress_id, _ in events} == {events[0][1]}
+    assert events[0][0].startswith("⏳ 正在执行命令 · 已用时")
+    assert events[-1][0].startswith("✅ 执行命令完成 · 共用时")
 
 
 def test_loop_refusal_fallback_model_derivation(tmp_path):
