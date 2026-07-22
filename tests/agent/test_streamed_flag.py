@@ -69,3 +69,56 @@ class TestStreamedFlag:
 
         assert result is not None
         assert result.metadata.get("_streamed") is True
+
+
+class TestToolProgressRouting:
+    @pytest.mark.asyncio
+    async def test_feishu_instance_uses_in_place_progress_metadata(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from nanobot.agent.runner import AgentRunner
+
+        monkeypatch.setattr(AgentRunner, "_TOOL_HEARTBEAT_FIRST", 0.01)
+        monkeypatch.setattr(AgentRunner, "_TOOL_HEARTBEAT_MAX", 0.01)
+        monkeypatch.setattr(AgentRunner, "_TOOL_HEARTBEAT_GROWTH", 1.0)
+
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(id="call1", name="exec", arguments={"command": "slow"})
+        calls = iter([
+            LLMResponse(content="", tool_calls=[tool_call]),
+            LLMResponse(content="done", tool_calls=[]),
+        ])
+
+        async def fake_chat(**kwargs):
+            return next(calls)
+
+        async def slow_tool(*args, **kwargs):
+            import asyncio
+
+            await asyncio.sleep(0.05)
+            return "ok"
+
+        loop.provider.chat_with_retry = AsyncMock(side_effect=fake_chat)
+        loop.tools.execute = slow_tool
+        loop.memory_consolidator.maybe_consolidate_by_tokens = AsyncMock()
+
+        msg = InboundMessage(
+            channel="feishu.jarvis",
+            sender_id="user1",
+            chat_id="chat123",
+            content="hi",
+        )
+        result = await loop._process_message(msg)
+
+        assert result is not None
+        progress = []
+        while loop.bus.outbound_size:
+            outbound = loop.bus.outbound.get_nowait()
+            if outbound.metadata.get("_tool_progress_id"):
+                progress.append(outbound)
+
+        assert len(progress) >= 2
+        assert {item.metadata["_tool_progress_id"] for item in progress} == {
+            progress[0].metadata["_tool_progress_id"]
+        }
+        assert progress[-1].metadata["_tool_progress_done"] is True

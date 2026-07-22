@@ -646,7 +646,7 @@ class AgentLoop:
         async def _bus_tool_progress(
             content: str, *, progress_id: str, done: bool,
         ) -> None:
-            if msg.channel != "feishu":
+            if msg.channel.split(".", 1)[0] != "feishu":
                 if not done:
                     await _bus_progress(content)
                 return
