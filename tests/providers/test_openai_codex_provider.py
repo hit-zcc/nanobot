@@ -1,6 +1,7 @@
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
@@ -385,6 +386,48 @@ async def test_unexpected_transport_error_does_not_expose_secret_or_raw_detail(m
 
 
 @pytest.mark.asyncio
+async def test_timeout_is_safely_classified_and_retried(monkeypatch):
+    provider = OpenAICodexProvider(credential_manager=FakeCredentials())
+    request_count = 0
+    delays = []
+
+    async def request(url, headers, body, on_content_delta=None):
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            raise httpx.ReadTimeout("synthetic-secret-timeout-detail")
+        return "ok", [], "stop", []
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", request)
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", fake_sleep)
+
+    result = await provider.chat_with_retry(messages=[{"role": "user", "content": "hi"}])
+
+    assert result.content == "ok"
+    assert request_count == 2
+    assert delays == [1]
+
+
+@pytest.mark.asyncio
+async def test_transport_error_is_safely_classified(monkeypatch):
+    provider = OpenAICodexProvider(credential_manager=FakeCredentials())
+
+    async def request(url, headers, body, on_content_delta=None):
+        raise httpx.ConnectError("synthetic-secret-connection-detail")
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", request)
+
+    result = await provider.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert result.finish_reason == "error"
+    assert result.content == "Error calling Codex: connection failed"
+    assert "synthetic-secret" not in result.content
+
+
+@pytest.mark.asyncio
 async def test_credential_error_message_is_not_reflected():
     secret = "credential-error-synthetic-secret"
 
@@ -473,4 +516,8 @@ async def test_request_codex_uses_default_tls_verification(monkeypatch):
     with pytest.raises(StopRequestError):
         await _request_codex("https://example.test", {}, {})
 
-    assert seen_kwargs == {"timeout": 60.0}
+    timeout = seen_kwargs["timeout"]
+    assert timeout.connect == 20.0
+    assert timeout.read == 300.0
+    assert timeout.write == 60.0
+    assert timeout.pool == 20.0

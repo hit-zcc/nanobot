@@ -267,6 +267,7 @@ class MemoryConsolidator:
     """Owns consolidation policy, locking, and session offset updates."""
 
     _MAX_CONSOLIDATION_ROUNDS = 5
+    _CONSOLIDATION_TRIGGER_RATIO = 0.75
 
     _SAFETY_BUFFER = 1024  # extra headroom for tokenizer estimation drift
 
@@ -374,16 +375,23 @@ class MemoryConsolidator:
         lock = self.get_lock(session.key)
         async with lock:
             budget = self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
-            target = budget // 2
+            trigger = min(
+                budget,
+                int(self.context_window_tokens * self._CONSOLIDATION_TRIGGER_RATIO),
+            )
+            if trigger <= 0:
+                return
+            target = max(1, budget // 2)
             estimated, source = self.estimate_session_prompt_tokens(session)
             if estimated <= 0:
                 return
-            if estimated < budget:
+            if estimated < trigger:
                 logger.debug(
-                    "Token consolidation idle {}: {}/{} via {}",
+                    "Token consolidation idle {}: {}/{} (trigger={}) via {}",
                     session.key,
                     estimated,
                     self.context_window_tokens,
+                    trigger,
                     source,
                 )
                 return

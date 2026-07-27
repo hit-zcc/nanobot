@@ -2,8 +2,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nanobot.agent.loop import AgentLoop
 import nanobot.agent.memory as memory_module
+from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse
 
@@ -38,6 +38,27 @@ async def test_prompt_below_threshold_does_not_consolidate(tmp_path) -> None:
     await loop.process_direct("hello", session_key="cli:test")
 
     loop.memory_consolidator.consolidate_messages.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_prompt_at_seventy_five_percent_triggers_consolidation(tmp_path, monkeypatch) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
+    loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    session = loop.sessions.get_or_create("cli:test")
+    session.messages = [
+        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
+        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
+        {"role": "user", "content": "u2", "timestamp": "2026-01-01T00:00:02"},
+    ]
+    loop.sessions.save(session)
+
+    estimates = iter(((150, "test"), (70, "test")))
+    loop.memory_consolidator.estimate_session_prompt_tokens = lambda _session: next(estimates)  # type: ignore[method-assign]
+    monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _message: 50)
+
+    await loop.memory_consolidator.maybe_consolidate_by_tokens(session)
+
+    loop.memory_consolidator.consolidate_messages.assert_awaited_once()
 
 
 @pytest.mark.asyncio

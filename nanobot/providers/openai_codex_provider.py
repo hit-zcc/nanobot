@@ -10,12 +10,14 @@ from collections.abc import Awaitable, Callable
 from typing import Any, AsyncGenerator
 
 import httpx
+from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.providers.codex_credentials import CodexCredentialError, CodexCredentialManager
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "nanobot"
+_CODEX_TIMEOUT = httpx.Timeout(connect=20.0, read=300.0, write=60.0, pool=20.0)
 _CONTINUATION_CACHE_LIMIT = 32
 _CONTINUATION_CACHE_TTL_SECONDS = 300.0
 
@@ -175,6 +177,12 @@ class OpenAICodexProvider(LLMProvider):
                 content=f"Error calling Codex: {_friendly_error(exc.status_code, '')}",
                 finish_reason="error",
             )
+        except httpx.TimeoutException as exc:
+            logger.warning("Codex request timed out ({})", type(exc).__name__)
+            return LLMResponse(content="Error calling Codex: request timed out", finish_reason="error")
+        except httpx.TransportError as exc:
+            logger.warning("Codex connection failed ({})", type(exc).__name__)
+            return LLMResponse(content="Error calling Codex: connection failed", finish_reason="error")
         except Exception:
             return LLMResponse(content="Error calling Codex: request failed", finish_reason="error")
 
@@ -231,7 +239,7 @@ async def _request_codex(
     body: dict[str, Any],
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[str, list[ToolCallRequest], str, list[dict[str, Any]]]:
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=_CODEX_TIMEOUT) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
                 text = await response.aread()
