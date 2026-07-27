@@ -70,6 +70,36 @@ class TestStreamedFlag:
         assert result is not None
         assert result.metadata.get("_streamed") is True
 
+    @pytest.mark.asyncio
+    async def test_max_iteration_message_not_hidden_by_earlier_streaming(
+        self, tmp_path: Path,
+    ) -> None:
+        """Tool commentary from earlier segments must not hide the hard-limit message."""
+        loop = _make_loop(tmp_path)
+        loop.max_iterations = 2
+        tool_call = ToolCallRequest(
+            id="call1", name="list_dir", arguments={"path": "."},
+        )
+
+        async def fake_stream(*args, on_content_delta=None, **kwargs):
+            if on_content_delta:
+                await on_content_delta("还在处理中")
+            return LLMResponse(content="还在处理中", tool_calls=[tool_call])
+
+        loop.provider.chat_stream_with_retry = AsyncMock(side_effect=fake_stream)
+        loop.tools.execute = AsyncMock(return_value="ok")
+
+        msg = InboundMessage(
+            channel="feishu", sender_id="user1", chat_id="chat123", content="hi",
+        )
+        result = await loop._process_message(
+            msg, on_stream=AsyncMock(), on_stream_end=AsyncMock(),
+        )
+
+        assert result is not None
+        assert "工具调用硬限制（2轮）" in result.content
+        assert not result.metadata.get("_streamed")
+
 
 class TestToolProgressRouting:
     @pytest.mark.asyncio
@@ -122,3 +152,38 @@ class TestToolProgressRouting:
             progress[0].metadata["_tool_progress_id"]
         }
         assert progress[-1].metadata["_tool_progress_done"] is True
+
+
+class TestIterationLimitNotices:
+    @pytest.mark.asyncio
+    async def test_main_agent_warning_is_sent_as_important_notice(
+        self, tmp_path: Path,
+    ) -> None:
+        loop = _make_loop(tmp_path)
+        loop.max_iterations = 11
+        tool_call = ToolCallRequest(
+            id="call1", name="list_dir", arguments={"path": "."},
+        )
+        loop.provider.chat_with_retry = AsyncMock(side_effect=[
+            LLMResponse(content="working", tool_calls=[tool_call]),
+            LLMResponse(content="done", tool_calls=[]),
+        ])
+        loop.tools.execute = AsyncMock(return_value="ok")
+        loop.memory_consolidator.maybe_consolidate_by_tokens = AsyncMock()
+
+        msg = InboundMessage(
+            channel="feishu", sender_id="user1", chat_id="chat123", content="hi",
+        )
+        result = await loop._process_message(msg)
+
+        assert result is not None
+        warning = next(
+            item
+            for item in (
+                loop.bus.outbound.get_nowait()
+                for _ in range(loop.bus.outbound_size)
+            )
+            if item.metadata.get("_important_notice")
+        )
+        assert "距离硬限制只剩 10 轮" in warning.content
+        assert warning.metadata["_important_notice"] is True

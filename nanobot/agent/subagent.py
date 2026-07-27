@@ -4,21 +4,24 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
-from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
-from nanobot.bus.events import InboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ExecToolConfig
 from nanobot.providers.base import LLMProvider
+
+if TYPE_CHECKING:
+    from nanobot.config.schema import WebSearchConfig
 
 
 class SubagentManager:
@@ -110,18 +113,27 @@ class SubagentManager:
             ))
             tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
             tools.register(WebFetchTool(proxy=self.web_proxy))
-            
+
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
             ]
+            manager = self
 
             class _SubagentHook(AgentHook):
                 async def before_execute_tools(self, context: AgentHookContext) -> None:
                     for tool_call in context.tool_calls:
                         args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                         logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
+
+                async def on_notice(self, context: AgentHookContext, message: str) -> None:
+                    await manager.bus.publish_outbound(OutboundMessage(
+                        channel=origin["channel"],
+                        chat_id=origin["chat_id"],
+                        content=f"后台任务「{label}」：{message}",
+                        metadata={"_important_notice": True},
+                    ))
 
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=messages,
@@ -130,8 +142,14 @@ class SubagentManager:
                 max_iterations=self.max_iterations,
                 hook=_SubagentHook(),
                 max_iterations_message=(
-                    "Task did not complete before reaching the maximum number of "
-                    "tool call iterations ({max_iterations})."
+                    "后台任务达到工具调用硬限制（{max_iterations}轮），"
+                    "因此被系统停止，任务尚未完成。"
+                ),
+                iteration_warning_remaining=10,
+                iteration_warning_message=(
+                    "已使用 {used_iterations}/{max_iterations} 轮模型/工具循环，"
+                    "距离硬限制只剩 {remaining_iterations} 轮；"
+                    "正在收敛并优先整理可交付结果。"
                 ),
                 error_message=None,
                 fail_on_tool_error=True,
@@ -228,7 +246,7 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
             lines.append("Failure:")
             lines.append(f"- {result.error}")
         return "\n".join(lines) or (result.error or "Error: subagent execution failed.")
-    
+
     def _build_subagent_prompt(self) -> str:
         """Build a focused system prompt for the subagent."""
         from nanobot.agent.context import ContextBuilder

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import os
 import time
 from contextlib import AsyncExitStack, nullcontext
@@ -16,10 +15,10 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.memory import MemoryConsolidator
-from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.runner import AgentRunner, AgentRunSpec
+from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
@@ -27,8 +26,8 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
-from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.bus.queue import MessageBus
+from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
@@ -274,6 +273,7 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        on_notice: Callable[[str], Awaitable[None]] | None = None,
         on_tool_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
@@ -281,6 +281,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
+        run_state: dict[str, Any] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop.
 
@@ -330,7 +331,9 @@ class AgentLoop:
                 loop_self._set_tool_context(channel, chat_id, message_id)
 
             async def on_notice(self, context: AgentHookContext, message: str) -> None:
-                if on_progress:
+                if on_notice:
+                    await on_notice(message)
+                elif on_progress:
                     await on_progress(message)
 
             async def on_tool_heartbeat(
@@ -375,6 +378,17 @@ class AgentLoop:
             max_iterations=self.max_iterations,
             hook=hook,
             error_message="Sorry, I encountered an error calling the AI model.",
+            max_iterations_message=(
+                "⚠️ 当前任务已达到工具调用硬限制（{max_iterations}轮），"
+                "系统因此停止了本轮；这不代表任务已经完成。"
+                "你可以让我继续，或把任务拆成更小的步骤。"
+            ),
+            iteration_warning_remaining=10,
+            iteration_warning_message=(
+                "⚠️ 当前任务已使用 {used_iterations}/{max_iterations} 轮模型/工具循环，"
+                "距离硬限制只剩 {remaining_iterations} 轮。"
+                "我会开始收敛并优先汇报结果；若仍未完成，触顶时会明确说明。"
+            ),
             refusal_message=(
                 "这条请求触发了模型的安全限制，我没法继续生成。"
                 "可以换个说法、拆成几步分开发，或改用其他模型再试。"
@@ -383,6 +397,8 @@ class AgentLoop:
             concurrent_tools=True,
         ))
         await hook.finish_tool_progress()
+        if run_state is not None:
+            run_state["stop_reason"] = result.stop_reason
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
@@ -643,6 +659,13 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
+        async def _bus_notice(content: str) -> None:
+            meta = dict(msg.metadata or {})
+            meta["_important_notice"] = True
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
+            ))
+
         async def _bus_tool_progress(
             content: str, *, progress_id: str, done: bool,
         ) -> None:
@@ -658,30 +681,41 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        # Track whether any visible content was actually streamed this turn.
-        # A turn can end with zero deltas (e.g. the model only made tool calls
-        # and its final message was empty) — in that case the final outbound
-        # message must NOT be marked _streamed, or the channel drops it and the
-        # user gets no reply at all.
-        streamed_any = False
+        # Only suppress the final outbound message when the final, successful
+        # stream segment already delivered it. Earlier tool-call commentary must
+        # not hide a later error or max-iteration explanation.
+        streamed_final_segment = False
         wrapped_on_stream = None
+        wrapped_on_stream_end = on_stream_end
         if on_stream is not None:
             _orig_on_stream = on_stream
 
             async def wrapped_on_stream(delta: str) -> None:
-                nonlocal streamed_any
+                nonlocal streamed_final_segment
                 if delta.strip():
-                    streamed_any = True
+                    streamed_final_segment = True
                 await _orig_on_stream(delta)
 
+            if on_stream_end is not None:
+                _orig_on_stream_end = on_stream_end
+
+                async def wrapped_on_stream_end(*, resuming: bool = False) -> None:
+                    nonlocal streamed_final_segment
+                    await _orig_on_stream_end(resuming=resuming)
+                    if resuming:
+                        streamed_final_segment = False
+
+        run_state: dict[str, Any] = {}
         final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
+            on_notice=_bus_notice,
             on_tool_progress=_bus_tool_progress if on_progress is None else None,
             on_stream=wrapped_on_stream,
-            on_stream_end=on_stream_end,
+            on_stream_end=wrapped_on_stream_end,
             channel=msg.channel, chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
+            run_state=run_state,
         )
 
         if final_content is None:
@@ -698,7 +732,10 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = dict(msg.metadata or {})
-        if streamed_any:
+        if (
+            streamed_final_segment
+            and run_state.get("stop_reason") == "completed"
+        ):
             meta["_streamed"] = True
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,

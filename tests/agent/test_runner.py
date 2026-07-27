@@ -230,6 +230,42 @@ async def test_runner_returns_max_iterations_fallback():
 
 
 @pytest.mark.asyncio
+async def test_runner_warns_once_when_iteration_limit_is_near():
+    from nanobot.agent.hook import AgentHook, AgentHookContext
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content="still working",
+        tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
+    ))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="tool result")
+    notices: list[str] = []
+
+    class NoticeHook(AgentHook):
+        async def on_notice(self, context: AgentHookContext, message: str) -> None:
+            notices.append(message)
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=4,
+        hook=NoticeHook(),
+        iteration_warning_remaining=2,
+    ))
+
+    assert result.stop_reason == "max_iterations"
+    assert notices == [
+        "⚠️ This task has used 2/4 model/tool iterations "
+        "and has 2 remaining before the hard limit."
+    ]
+
+
+@pytest.mark.asyncio
 async def test_runner_surfaces_refusal_message_when_content_empty():
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
 
@@ -652,8 +688,8 @@ async def test_loop_max_iterations_message_stays_stable(tmp_path):
     final_content, _, _ = await loop._run_agent_loop([])
 
     assert final_content == (
-        "I reached the maximum number of tool call iterations (2) "
-        "without completing the task. You can try breaking the task into smaller steps."
+        "⚠️ 当前任务已达到工具调用硬限制（2轮），系统因此停止了本轮；"
+        "这不代表任务已经完成。你可以让我继续，或把任务拆成更小的步骤。"
     )
 
 
@@ -711,11 +747,42 @@ async def test_subagent_max_iterations_announces_failure(tmp_path, monkeypatch):
 
     mgr._announce_result.assert_awaited_once()
     args = mgr._announce_result.await_args.args
-    assert args[3] == (
-        "Task did not complete before reaching the maximum number of "
-        "tool call iterations (2)."
-    )
+    assert args[3] == "后台任务达到工具调用硬限制（2轮），因此被系统停止，任务尚未完成。"
     assert args[5] == "error"
+
+
+@pytest.mark.asyncio
+async def test_subagent_warns_origin_chat_when_limit_is_near(tmp_path, monkeypatch):
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(
+            content="working",
+            tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={})],
+        ),
+        LLMResponse(content="done", tool_calls=[]),
+    ])
+    mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus, max_iterations=11)
+    mgr._announce_result = AsyncMock()
+
+    async def fake_execute(self, name, arguments):
+        return "tool result"
+
+    monkeypatch.setattr("nanobot.agent.tools.registry.ToolRegistry.execute", fake_execute)
+
+    await mgr._run_subagent(
+        "sub-1", "do task", "long task", {"channel": "feishu", "chat_id": "c1"},
+    )
+
+    warning = bus.outbound.get_nowait()
+    assert warning.channel == "feishu"
+    assert warning.chat_id == "c1"
+    assert "距离硬限制只剩 10 轮" in warning.content
+    assert warning.metadata["_important_notice"] is True
 
 
 @pytest.mark.asyncio

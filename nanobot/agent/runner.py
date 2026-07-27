@@ -19,6 +19,10 @@ _DEFAULT_MAX_ITERATIONS_MESSAGE = (
     "I reached the maximum number of tool call iterations ({max_iterations}) "
     "without completing the task. You can try breaking the task into smaller steps."
 )
+_DEFAULT_ITERATION_WARNING_MESSAGE = (
+    "⚠️ This task has used {used_iterations}/{max_iterations} model/tool iterations "
+    "and has {remaining_iterations} remaining before the hard limit."
+)
 _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
 _DEFAULT_REFUSAL_MESSAGE = (
     "The model declined to continue on this request (safety refusal). "
@@ -42,6 +46,8 @@ class AgentRunSpec:
     refusal_message: str | None = _DEFAULT_REFUSAL_MESSAGE
     refusal_fallback_model: str | None = None
     max_iterations_message: str | None = None
+    iteration_warning_remaining: int | None = None
+    iteration_warning_message: str | None = None
     concurrent_tools: bool = False
     fail_on_tool_error: bool = False
 
@@ -88,6 +94,24 @@ class AgentRunner:
         for iteration in range(spec.max_iterations):
             context = AgentHookContext(iteration=iteration, messages=messages)
             await hook.before_iteration(context)
+            remaining_iterations = spec.max_iterations - iteration
+            if (
+                spec.iteration_warning_remaining is not None
+                and spec.max_iterations > spec.iteration_warning_remaining
+                and remaining_iterations == spec.iteration_warning_remaining
+            ):
+                template = (
+                    spec.iteration_warning_message
+                    or _DEFAULT_ITERATION_WARNING_MESSAGE
+                )
+                await hook.on_notice(
+                    context,
+                    template.format(
+                        used_iterations=iteration,
+                        max_iterations=spec.max_iterations,
+                        remaining_iterations=remaining_iterations,
+                    ),
+                )
             kwargs: dict[str, Any] = {
                 "messages": messages,
                 "tools": spec.tools.get_definitions(),
