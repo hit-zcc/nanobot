@@ -371,6 +371,91 @@ async def test_send_sanitizes_unresolved_mention_placeholder() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_uses_native_text_mention_for_group_sender() -> None:
+    channel = _make_feishu_channel(reply_to_message=False)
+    sent: list[tuple[str, str, str, str]] = []
+
+    with patch.object(
+        channel,
+        "_send_message_sync",
+        side_effect=lambda *args: sent.append(args),
+    ):
+        await channel.send(OutboundMessage(
+            channel="feishu",
+            chat_id="oc_abc",
+            content="@wuw 查清楚了",
+            metadata={
+                "chat_type": "group",
+                "sender_type": "user",
+                "sender_open_id": "ou_alice",
+            },
+        ))
+
+    assert sent[0][2] == "text"
+    assert json.loads(sent[0][3])["text"] == (
+        '<at user_id="ou_alice">wuw</at> 查清楚了'
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_uses_native_post_mention_for_group_sender() -> None:
+    channel = _make_feishu_channel(reply_to_message=False)
+    sent: list[tuple[str, str, str, str]] = []
+
+    with patch.object(
+        channel,
+        "_send_message_sync",
+        side_effect=lambda *args: sent.append(args),
+    ):
+        await channel.send(OutboundMessage(
+            channel="feishu",
+            chat_id="oc_abc",
+            content="@wuw 请看 [文档](https://example.com)",
+            metadata={
+                "chat_type": "group",
+                "sender_type": "user",
+                "sender_open_id": "ou_alice",
+            },
+        ))
+
+    assert sent[0][2] == "post"
+    paragraph = json.loads(sent[0][3])["zh_cn"]["content"][0]
+    assert paragraph[0] == {
+        "tag": "at",
+        "user_id": "ou_alice",
+        "user_name": "wuw",
+    }
+
+
+@pytest.mark.asyncio
+async def test_send_uses_native_card_mention_for_group_sender() -> None:
+    channel = _make_feishu_channel(reply_to_message=False)
+    sent: list[tuple[str, str, str, str]] = []
+
+    with patch.object(
+        channel,
+        "_send_message_sync",
+        side_effect=lambda *args: sent.append(args),
+    ):
+        await channel.send(OutboundMessage(
+            channel="feishu",
+            chat_id="oc_abc",
+            content="@wuw **严重问题**",
+            metadata={
+                "chat_type": "group",
+                "sender_type": "user",
+                "sender_open_id": "ou_alice",
+            },
+        ))
+
+    assert sent[0][2] == "interactive"
+    card = json.loads(sent[0][3])
+    assert card["elements"][0]["content"].startswith(
+        '<at id="ou_alice"></at> **严重问题**'
+    )
+
+
+@pytest.mark.asyncio
 async def test_send_uses_create_api_when_no_message_id() -> None:
     channel = _make_feishu_channel(reply_to_message=True)
 
@@ -570,6 +655,7 @@ async def test_on_message_accepts_group_bot_message_when_explicitly_mentioned() 
     assert "@Jarvis 请检查任务" in captured[0]["content"]
     assert "@_user_1" not in captured[0]["content"]
     assert captured[0]["metadata"]["sender_type"] == "bot"
+    assert captured[0]["metadata"]["sender_open_id"] == "ou_other_bot"
     assert captured[0]["metadata"]["mentions"] == [{
         "key": "@_user_1",
         "name": "Jarvis",

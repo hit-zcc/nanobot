@@ -1,6 +1,7 @@
 """Feishu/Lark channel implementation using lark-oapi SDK with WebSocket long connection."""
 
 import asyncio
+import html
 import json
 import os
 import re
@@ -305,6 +306,17 @@ def _sanitize_unresolved_mentions(text: str) -> str:
     return re.sub(r"@_user_\d+\b", "@用户", text)
 
 
+_LEADING_DISPLAY_MENTION_RE = re.compile(r"^\s*@([^\s,，:：]+)[\s,，:：]*")
+
+
+def _split_leading_display_mention(text: str) -> tuple[str, str]:
+    """Extract an LLM-rendered leading ``@name`` for use as an at-label."""
+    match = _LEADING_DISPLAY_MENTION_RE.match(text)
+    if not match:
+        return "用户", text.lstrip()
+    return match.group(1), text[match.end():].lstrip()
+
+
 class FeishuConfig(Base):
     """Feishu/Lark channel configuration using WebSocket long connection."""
 
@@ -372,6 +384,7 @@ class FeishuChannel(BaseChannel):
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._processed_card_actions: OrderedDict[str, None] = OrderedDict()
+        self._reply_targets: OrderedDict[str, str] = OrderedDict()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
         self._tool_progress_messages: dict[str, str] = {}
@@ -755,8 +768,29 @@ class FeishuChannel(BaseChannel):
         # Medium plain text without any formatting → post format
         return "post"
 
+    def _outbound_mention_target(self, metadata: dict[str, Any] | None) -> str | None:
+        """Return the real Feishu open_id to mention for a group reply."""
+        meta = metadata or {}
+        if meta.get("_progress") or meta.get("_tool_hint"):
+            return None
+        if meta.get("sender_type") == "bot":
+            return None
+
+        target = ""
+        if meta.get("chat_type") == "group":
+            target = str(meta.get("sender_open_id") or "")
+        if not target and meta.get("message_id"):
+            target = self._reply_targets.get(str(meta["message_id"]), "")
+        return target if re.fullmatch(r"ou_[A-Za-z0-9_-]+", target) else None
+
     @classmethod
-    def _markdown_to_post(cls, content: str) -> str:
+    def _markdown_to_post(
+        cls,
+        content: str,
+        *,
+        mention_target: str | None = None,
+        mention_label: str = "用户",
+    ) -> str:
         """Convert markdown content to Feishu post message JSON.
 
         Handles links ``[text](url)`` as ``a`` tags; everything else as ``text`` tags.
@@ -791,6 +825,16 @@ class FeishuChannel(BaseChannel):
                 elements.append({"tag": "text", "text": ""})
 
             paragraphs.append(elements)
+
+        if mention_target:
+            paragraphs[0][0:0] = [
+                {
+                    "tag": "at",
+                    "user_id": mention_target,
+                    "user_name": mention_label or "用户",
+                },
+                {"tag": "text", "text": " "},
+            ]
 
         post_body = {
             "zh_cn": {
@@ -1330,6 +1374,10 @@ class FeishuChannel(BaseChannel):
         if buf is None:
             buf = _FeishuStreamBuf()
             self._stream_bufs[chat_id] = buf
+            mention_target = self._outbound_mention_target(meta)
+            if mention_target:
+                _, delta = _split_leading_display_mention(delta)
+                buf.text = f'<at id="{mention_target}"></at> '
         buf.text += delta
         if not buf.text.strip():
             return
@@ -1434,20 +1482,37 @@ class FeishuChannel(BaseChannel):
 
             if msg.content and msg.content.strip():
                 fmt = self._detect_msg_format(msg.content)
+                mention_target = self._outbound_mention_target(msg.metadata)
+                mention_label = ""
+                content = msg.content
+                if mention_target:
+                    mention_label, content = _split_leading_display_mention(content)
 
                 if fmt == "text":
                     # Short plain text – send as simple text message
-                    text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
+                    if mention_target:
+                        label = html.escape(mention_label, quote=True)
+                        content = (
+                            f'<at user_id="{mention_target}">{label}</at> '
+                            f"{content}"
+                        )
+                    text_body = json.dumps({"text": content.strip()}, ensure_ascii=False)
                     await loop.run_in_executor(None, _do_send, "text", text_body)
 
                 elif fmt == "post":
                     # Medium content with links – send as rich-text post
-                    post_body = self._markdown_to_post(msg.content)
+                    post_body = self._markdown_to_post(
+                        content,
+                        mention_target=mention_target,
+                        mention_label=mention_label,
+                    )
                     await loop.run_in_executor(None, _do_send, "post", post_body)
 
                 else:
                     # Complex / long content – send as interactive card
-                    elements = self._build_card_elements(msg.content)
+                    if mention_target:
+                        content = f'<at id="{mention_target}"></at> {content}'
+                    elements = self._build_card_elements(content)
                     for chunk in self._split_elements_by_table_limit(elements):
                         card = {"config": {"wide_screen_mode": True}, "elements": chunk}
                         await loop.run_in_executor(
@@ -1722,6 +1787,10 @@ class FeishuChannel(BaseChannel):
 
             # Forward to message bus
             reply_to = chat_id if chat_type == "group" else sender_id
+            if chat_type == "group" and sender_type != "bot" and sender_id.startswith("ou_"):
+                self._reply_targets[message_id] = sender_id
+                while len(self._reply_targets) > 1000:
+                    self._reply_targets.popitem(last=False)
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
@@ -1732,6 +1801,7 @@ class FeishuChannel(BaseChannel):
                     "chat_type": chat_type,
                     "msg_type": msg_type,
                     "sender_type": sender_type,
+                    "sender_open_id": sender_id,
                     "mentions": resolved_mentions,
                     "parent_id": parent_id,
                     "root_id": root_id,
