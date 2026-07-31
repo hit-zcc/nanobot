@@ -263,6 +263,43 @@ def _extract_post_text(content_json: dict) -> str:
     return text
 
 
+def _resolve_text_mentions(
+    text: str,
+    mentions: list[Any] | None,
+) -> tuple[str, list[dict[str, str]]]:
+    """Replace Feishu ``@_user_N`` placeholders with readable display names."""
+    resolved: list[dict[str, str]] = []
+    replacements: list[tuple[str, str]] = []
+
+    for mention in mentions or []:
+        key = str(getattr(mention, "key", None) or "")
+        mention_id = getattr(mention, "id", None)
+        name = str(getattr(mention, "name", None) or "").lstrip("@")
+        open_id = str(getattr(mention_id, "open_id", None) or "")
+        user_id = str(getattr(mention_id, "user_id", None) or "")
+        union_id = str(getattr(mention_id, "union_id", None) or "")
+
+        label = name or open_id or user_id or union_id
+        if key and label:
+            replacements.append((key, f"@{label}"))
+        resolved.append({
+            key_name: value
+            for key_name, value in {
+                "key": key,
+                "name": name,
+                "open_id": open_id,
+                "user_id": user_id,
+                "union_id": union_id,
+            }.items()
+            if value
+        })
+
+    # Replace longer keys first so @_user_1 cannot partially alter @_user_10.
+    for key, label in sorted(replacements, key=lambda item: len(item[0]), reverse=True):
+        text = text.replace(key, label)
+    return text, resolved
+
+
 class FeishuConfig(Base):
     """Feishu/Lark channel configuration using WebSocket long connection."""
 
@@ -1600,10 +1637,15 @@ class FeishuChannel(BaseChannel):
                 content_json = json.loads(message.content) if message.content else {}
             except json.JSONDecodeError:
                 content_json = {}
+            resolved_mentions: list[dict[str, str]] = []
 
             if msg_type == "text":
                 text = content_json.get("text", "")
                 if text:
+                    text, resolved_mentions = _resolve_text_mentions(
+                        text,
+                        getattr(message, "mentions", None),
+                    )
                     content_parts.append(text)
 
             elif msg_type == "post":
@@ -1676,6 +1718,7 @@ class FeishuChannel(BaseChannel):
                     "chat_type": chat_type,
                     "msg_type": msg_type,
                     "sender_type": sender_type,
+                    "mentions": resolved_mentions,
                     "parent_id": parent_id,
                     "root_id": root_id,
                     "thread_id": thread_id,

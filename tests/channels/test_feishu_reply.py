@@ -19,7 +19,11 @@ if not FEISHU_AVAILABLE:
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.feishu import FeishuChannel, FeishuConfig
+from nanobot.channels.feishu import (
+    FeishuChannel,
+    FeishuConfig,
+    _resolve_text_mentions,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +99,47 @@ def test_feishu_config_reply_to_message_defaults_false() -> None:
 def test_feishu_config_reply_to_message_can_be_enabled() -> None:
     config = FeishuConfig(reply_to_message=True)
     assert config.reply_to_message is True
+
+
+def test_resolve_text_mentions_uses_name_and_preserves_ids() -> None:
+    mention = SimpleNamespace(
+        key="@_user_1",
+        name="小步",
+        id=SimpleNamespace(
+            open_id="ou_bot",
+            user_id=None,
+            union_id="on_bot",
+        ),
+    )
+
+    text, resolved = _resolve_text_mentions("@_user_1 请检查", [mention])
+
+    assert text == "@小步 请检查"
+    assert resolved == [{
+        "key": "@_user_1",
+        "name": "小步",
+        "open_id": "ou_bot",
+        "union_id": "on_bot",
+    }]
+
+
+def test_resolve_text_mentions_replaces_longer_keys_first() -> None:
+    mentions = [
+        SimpleNamespace(
+            key="@_user_1",
+            name="一号",
+            id=SimpleNamespace(open_id="ou_1", user_id=None, union_id=None),
+        ),
+        SimpleNamespace(
+            key="@_user_10",
+            name="十号",
+            id=SimpleNamespace(open_id="ou_10", user_id=None, union_id=None),
+        ),
+    ]
+
+    text, _ = _resolve_text_mentions("@_user_10 回复 @_user_1", mentions)
+
+    assert text == "@十号 回复 @一号"
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +494,8 @@ async def test_on_message_no_extra_api_call_when_no_parent_id() -> None:
 
 def _bot_mention() -> SimpleNamespace:
     return SimpleNamespace(
+        key="@_user_1",
+        name="Jarvis",
         id=SimpleNamespace(user_id=None, open_id="ou_current_bot"),
     )
 
@@ -478,7 +525,14 @@ async def test_on_message_accepts_group_bot_message_when_explicitly_mentioned() 
     assert captured[0]["sender_id"] == "ou_other_bot"
     assert captured[0]["chat_id"] == "oc_abc"
     assert captured[0]["content"].startswith("[Message from another Feishu bot")
+    assert "@Jarvis 请检查任务" in captured[0]["content"]
+    assert "@_user_1" not in captured[0]["content"]
     assert captured[0]["metadata"]["sender_type"] == "bot"
+    assert captured[0]["metadata"]["mentions"] == [{
+        "key": "@_user_1",
+        "name": "Jarvis",
+        "open_id": "ou_current_bot",
+    }]
 
 
 @pytest.mark.asyncio
