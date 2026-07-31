@@ -3,7 +3,7 @@ import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -49,6 +49,8 @@ def _make_feishu_event(
     msg_type: str = "text",
     content: str = '{"text": "hello"}',
     sender_open_id: str = "ou_alice",
+    sender_type: str = "user",
+    mentions: list | None = None,
     parent_id: str | None = None,
     root_id: str | None = None,
 ):
@@ -60,10 +62,10 @@ def _make_feishu_event(
         content=content,
         parent_id=parent_id,
         root_id=root_id,
-        mentions=[],
+        mentions=mentions or [],
     )
     sender = SimpleNamespace(
-        sender_type="user",
+        sender_type=sender_type,
         sender_id=SimpleNamespace(open_id=sender_open_id),
     )
     return SimpleNamespace(event=SimpleNamespace(message=message, sender=sender))
@@ -443,3 +445,73 @@ async def test_on_message_no_extra_api_call_when_no_parent_id() -> None:
 
     channel._client.im.v1.message.get.assert_not_called()
     assert len(captured) == 1
+
+
+def _bot_mention() -> SimpleNamespace:
+    return SimpleNamespace(
+        id=SimpleNamespace(user_id=None, open_id="ou_current_bot"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_message_accepts_group_bot_message_when_explicitly_mentioned() -> None:
+    channel = _make_feishu_channel()
+    channel.config.group_policy = "open"
+    captured = []
+
+    async def _capture(**kwargs):
+        captured.append(kwargs)
+
+    channel._handle_message = _capture
+    with patch.object(channel, "_add_reaction", return_value=None):
+        await channel._on_message(
+            _make_feishu_event(
+                chat_type="group",
+                sender_type="bot",
+                sender_open_id="ou_other_bot",
+                mentions=[_bot_mention()],
+                content='{"text": "@_user_1 请检查任务"}',
+            )
+        )
+
+    assert len(captured) == 1
+    assert captured[0]["sender_id"] == "ou_other_bot"
+    assert captured[0]["chat_id"] == "oc_abc"
+    assert captured[0]["content"].startswith("[Message from another Feishu bot")
+    assert captured[0]["metadata"]["sender_type"] == "bot"
+
+
+@pytest.mark.asyncio
+async def test_on_message_ignores_undirected_group_bot_message_even_when_open() -> None:
+    channel = _make_feishu_channel()
+    channel.config.group_policy = "open"
+    channel._handle_message = AsyncMock()
+
+    with patch.object(channel, "_add_reaction", return_value=None):
+        await channel._on_message(
+            _make_feishu_event(
+                chat_type="group",
+                sender_type="bot",
+                sender_open_id="ou_other_bot",
+            )
+        )
+
+    channel._handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_on_message_ignores_bot_direct_message() -> None:
+    channel = _make_feishu_channel()
+    channel._handle_message = AsyncMock()
+
+    with patch.object(channel, "_add_reaction", return_value=None):
+        await channel._on_message(
+            _make_feishu_event(
+                chat_type="p2p",
+                sender_type="bot",
+                sender_open_id="ou_other_bot",
+                mentions=[_bot_mention()],
+            )
+        )
+
+    channel._handle_message.assert_not_awaited()

@@ -1571,16 +1571,21 @@ class FeishuChannel(BaseChannel):
             while len(self._processed_message_ids) > 1000:
                 self._processed_message_ids.popitem(last=False)
 
-            # Skip bot messages
-            if sender.sender_type == "bot":
-                return
-
             sender_id = sender.sender_id.open_id if sender.sender_id else "unknown"
             chat_id = message.chat_id
             chat_type = message.chat_type
             msg_type = message.message_type
+            sender_type = sender.sender_type
 
-            if chat_type == "group" and not self._is_group_message_for_bot(message):
+            if sender_type == "bot":
+                # Feishu only delivers these with
+                # im:message.group_at_msg.include_bot:readonly. Keep an explicit
+                # mention requirement even when groupPolicy=open so two open bots
+                # cannot accidentally enter an unbounded reply loop.
+                if chat_type != "group" or not self._is_bot_mentioned(message):
+                    logger.debug("Feishu: skipping non-directed bot message")
+                    return
+            elif chat_type == "group" and not self._is_group_message_for_bot(message):
                 logger.debug("Feishu: skipping group message (not mentioned)")
                 return
 
@@ -1653,6 +1658,11 @@ class FeishuChannel(BaseChannel):
 
             if not content and not media_paths:
                 return
+            if sender_type == "bot":
+                content = (
+                    "[Message from another Feishu bot; explicitly addressed to this bot]\n"
+                    + content
+                )
 
             # Forward to message bus
             reply_to = chat_id if chat_type == "group" else sender_id
@@ -1665,6 +1675,7 @@ class FeishuChannel(BaseChannel):
                     "message_id": message_id,
                     "chat_type": chat_type,
                     "msg_type": msg_type,
+                    "sender_type": sender_type,
                     "parent_id": parent_id,
                     "root_id": root_id,
                     "thread_id": thread_id,
