@@ -168,6 +168,34 @@ class TestSendDelta:
         )
 
     @pytest.mark.asyncio
+    async def test_native_mention_waits_for_split_display_name(self):
+        ch = _make_channel()
+        ch._reply_targets["om_user"] = "ou_alice"
+        ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_new")
+        ch._client.im.v1.message.create.return_value = _mock_send_response("om_new")
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        await ch.send_delta(
+            "oc_chat1",
+            "@w",
+            metadata={"message_id": "om_user"},
+        )
+
+        assert ch._stream_bufs["oc_chat1"].text == "@w"
+        ch._client.cardkit.v1.card.create.assert_not_called()
+
+        await ch.send_delta(
+            "oc_chat1",
+            "uw Prompt 侧单独改以下 4 项即可",
+            metadata={"message_id": "om_user"},
+        )
+
+        assert ch._stream_bufs["oc_chat1"].text == (
+            '<at id="ou_alice"></at> Prompt 侧单独改以下 4 项即可'
+        )
+        ch._client.cardkit.v1.card.create.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_second_delta_within_interval_skips_update(self):
         ch = _make_channel()
         buf = _FeishuStreamBuf(text="Hello ", card_id="card_1", sequence=1, last_edit=time.monotonic())

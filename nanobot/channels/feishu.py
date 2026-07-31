@@ -348,6 +348,8 @@ _STREAM_ELEMENT_ID = "streaming_md"
 class _FeishuStreamBuf:
     """Per-chat streaming accumulator using CardKit streaming API."""
     text: str = ""
+    mention_target: str | None = None
+    mention_pending: bool = False
     card_id: str | None = None
     sequence: int = 0
     last_edit: float = 0.0
@@ -369,6 +371,38 @@ class FeishuChannel(BaseChannel):
     display_name = "Feishu"
 
     _STREAM_EDIT_INTERVAL = 0.5  # throttle between CardKit streaming updates
+    _STREAM_LEADING_MENTION_RE = re.compile(
+        r"^\s*@([^\s,，:：]+)[\s,，:：]+"
+    )
+
+    @classmethod
+    def _finalize_stream_mention(
+        cls,
+        buf: _FeishuStreamBuf,
+        *,
+        force: bool = False,
+    ) -> bool:
+        """Wait for a complete streamed ``@name`` token before removing it."""
+        if not buf.mention_pending or not buf.mention_target:
+            return True
+
+        stripped = buf.text.lstrip()
+        if not stripped:
+            return False
+        if stripped.startswith("@"):
+            match = cls._STREAM_LEADING_MENTION_RE.match(buf.text)
+            if not match and not force:
+                return False
+            if match:
+                remainder = buf.text[match.end():].lstrip()
+            else:
+                _, remainder = _split_leading_display_mention(buf.text)
+        else:
+            remainder = stripped
+
+        buf.text = f'<at id="{buf.mention_target}"></at> {remainder}'
+        buf.mention_pending = False
+        return True
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
@@ -1344,6 +1378,7 @@ class FeishuChannel(BaseChannel):
             buf = self._stream_bufs.pop(chat_id, None)
             if not buf or not buf.text:
                 return
+            self._finalize_stream_mention(buf, force=True)
             if buf.card_id:
                 buf.sequence += 1
                 await loop.run_in_executor(
@@ -1376,10 +1411,12 @@ class FeishuChannel(BaseChannel):
             self._stream_bufs[chat_id] = buf
             mention_target = self._outbound_mention_target(meta)
             if mention_target:
-                _, delta = _split_leading_display_mention(delta)
-                buf.text = f'<at id="{mention_target}"></at> '
+                buf.mention_target = mention_target
+                buf.mention_pending = True
         buf.text += delta
         if not buf.text.strip():
+            return
+        if not self._finalize_stream_mention(buf):
             return
 
         now = time.monotonic()
