@@ -300,6 +300,11 @@ def _resolve_text_mentions(
     return text, resolved
 
 
+def _sanitize_unresolved_mentions(text: str) -> str:
+    """Prevent internal Feishu mention placeholders from reaching users."""
+    return re.sub(r"@_user_\d+\b", "@用户", text)
+
+
 class FeishuConfig(Base):
     """Feishu/Lark channel configuration using WebSocket long connection."""
 
@@ -986,6 +991,10 @@ class FeishuChannel(BaseChannel):
             msg_type = getattr(msg_obj, "msg_type", "")
             if msg_type == "text":
                 text = content_json.get("text", "").strip()
+                text, _ = _resolve_text_mentions(
+                    text,
+                    getattr(msg_obj, "mentions", None),
+                )
             elif msg_type == "post":
                 text, _ = _extract_post_content(content_json)
                 text = text.strip()
@@ -1347,6 +1356,11 @@ class FeishuChannel(BaseChannel):
             return
 
         try:
+            sanitized_content = _sanitize_unresolved_mentions(msg.content)
+            if sanitized_content != msg.content:
+                logger.warning("Feishu: sanitized unresolved mention placeholder in outbound message")
+                msg.content = sanitized_content
+
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
 

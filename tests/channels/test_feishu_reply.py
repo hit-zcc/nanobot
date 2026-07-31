@@ -75,10 +75,15 @@ def _make_feishu_event(
     return SimpleNamespace(event=SimpleNamespace(message=message, sender=sender))
 
 
-def _make_get_message_response(text: str, msg_type: str = "text", success: bool = True):
+def _make_get_message_response(
+    text: str,
+    msg_type: str = "text",
+    success: bool = True,
+    mentions: list | None = None,
+):
     """Build a fake im.v1.message.get response object."""
     body = SimpleNamespace(content=json.dumps({"text": text}))
-    item = SimpleNamespace(msg_type=msg_type, body=body)
+    item = SimpleNamespace(msg_type=msg_type, body=body, mentions=mentions or [])
     data = SimpleNamespace(items=[item])
     resp = MagicMock()
     resp.success.return_value = success
@@ -153,6 +158,23 @@ def test_get_message_content_sync_returns_reply_prefix() -> None:
     result = channel._get_message_content_sync("om_parent")
 
     assert result == "[Reply to: what time is it?]"
+
+
+def test_get_message_content_sync_resolves_parent_mentions() -> None:
+    channel = _make_feishu_channel()
+    mention = SimpleNamespace(
+        key="@_user_1",
+        name="小橘",
+        id=SimpleNamespace(open_id="ou_bot", user_id=None, union_id=None),
+    )
+    channel._client.im.v1.message.get.return_value = _make_get_message_response(
+        "@_user_1 请重新回答",
+        mentions=[mention],
+    )
+
+    result = channel._get_message_content_sync("om_parent")
+
+    assert result == "[Reply to: @小橘 请重新回答]"
 
 
 def test_get_message_content_sync_truncates_long_text() -> None:
@@ -326,6 +348,26 @@ async def test_send_uses_create_api_when_reply_disabled() -> None:
 
     channel._client.im.v1.message.create.assert_called_once()
     channel._client.im.v1.message.reply.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_send_sanitizes_unresolved_mention_placeholder() -> None:
+    channel = _make_feishu_channel(reply_to_message=False)
+    sent: list[tuple[str, str, str, str]] = []
+
+    with patch.object(
+        channel,
+        "_send_message_sync",
+        side_effect=lambda *args: sent.append(args),
+    ):
+        await channel.send(OutboundMessage(
+            channel="feishu",
+            chat_id="oc_abc",
+            content="@_user_1 查清楚了",
+            metadata={},
+        ))
+
+    assert json.loads(sent[0][3])["text"] == "@用户 查清楚了"
 
 
 @pytest.mark.asyncio
