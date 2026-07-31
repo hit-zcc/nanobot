@@ -393,7 +393,7 @@ async def test_send_uses_native_text_mention_for_group_sender() -> None:
 
     assert sent[0][2] == "text"
     assert json.loads(sent[0][3])["text"] == (
-        '<at user_id="ou_alice">wuw</at> 查清楚了'
+        '<at user_id="ou_alice">用户</at> 查清楚了'
     )
 
 
@@ -423,7 +423,7 @@ async def test_send_uses_native_post_mention_for_group_sender() -> None:
     assert paragraph[0] == {
         "tag": "at",
         "user_id": "ou_alice",
-        "user_name": "wuw",
+        "user_name": "用户",
     }
 
 

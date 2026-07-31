@@ -1520,10 +1520,13 @@ class FeishuChannel(BaseChannel):
             if msg.content and msg.content.strip():
                 fmt = self._detect_msg_format(msg.content)
                 mention_target = self._outbound_mention_target(msg.metadata)
-                mention_label = ""
+                mention_label = "用户"
                 content = msg.content
                 if mention_target:
-                    mention_label, content = _split_leading_display_mention(content)
+                    # The leading name usually came from the inbound mention of
+                    # this bot (for example ``@Jarvis``), not from the sender.
+                    # Never reuse it as the sender's outbound at-label.
+                    _, content = _split_leading_display_mention(content)
 
                 if fmt == "text":
                     # Short plain text – send as simple text message
