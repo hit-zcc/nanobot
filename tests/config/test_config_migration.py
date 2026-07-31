@@ -21,6 +21,43 @@ def test_config_round_trips_fast_service_tier(tmp_path) -> None:
     assert saved["agents"]["defaults"]["serviceTier"] == "fast"
 
 
+def test_config_loads_multi_agent_bindings_and_heartbeat_target(tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "defaults": {"workspace": "/tmp/default"},
+                    "list": [
+                        {"id": "jarvis", "workspace": "/tmp/work"},
+                        {"id": "life-buddy", "workspace": "/tmp/life"},
+                    ],
+                    "bindings": [
+                        {"agentId": "life-buddy", "channel": "feishu"},
+                        {"agentId": "jarvis", "channel": "feishu.jarvis"},
+                    ],
+                },
+                "gateway": {
+                    "heartbeat": {
+                        "agentId": "life-buddy",
+                        "channel": "feishu",
+                        "chatId": "life-user",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert [agent.id for agent in config.agents.agents] == ["jarvis", "life-buddy"]
+    assert config.agents.bindings[0].agent_id == "life-buddy"
+    assert config.gateway.heartbeat.agent_id == "life-buddy"
+    assert config.gateway.heartbeat.channel == "feishu"
+    assert config.gateway.heartbeat.chat_id == "life-user"
+
+
 def test_load_config_keeps_max_tokens_and_ignores_legacy_memory_window(tmp_path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text(

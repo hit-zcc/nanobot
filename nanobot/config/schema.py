@@ -46,10 +46,31 @@ class AgentDefaults(Base):
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
 
 
+class AgentConfig(Base):
+    """One independently routed agent."""
+
+    id: str
+    name: str = ""
+    workspace: str = ""
+    agent_dir: str = ""
+    model: str | None = None
+    provider: str | None = None
+
+
+class BindingConfig(Base):
+    """Route matching inbound messages to an agent. First match wins."""
+
+    agent_id: str
+    channel: str | None = None
+    chat_id: str | None = None
+
+
 class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    agents: list[AgentConfig] = Field(default_factory=list, alias="list")
+    bindings: list[BindingConfig] = Field(default_factory=list)
 
 
 class ProviderConfig(Base):
@@ -97,6 +118,9 @@ class HeartbeatConfig(Base):
     enabled: bool = True
     interval_s: int = 30 * 60  # 30 minutes
     keep_recent_messages: int = 8
+    agent_id: str | None = None
+    channel: str | None = None
+    chat_id: str | None = None
 
 
 class GatewayConfig(Base):
