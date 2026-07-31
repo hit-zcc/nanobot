@@ -294,6 +294,28 @@ class TestToolProgressMessages:
         }
         ch._client.im.v1.message.patch.assert_not_called()
         assert "progress-1" not in ch._tool_progress_messages
+        assert "progress-1" not in ch._tool_progress_last_notified
+
+    @pytest.mark.asyncio
+    async def test_long_task_creates_fresh_liveness_notice(self):
+        ch = _make_channel()
+        ch.config.progress_notify_interval_s = 120
+        ch._client.im.v1.message.create.side_effect = [
+            _mock_send_response("om_progress_1"),
+            _mock_send_response("om_progress_2"),
+        ]
+
+        await ch.send(self._message("⏳ 正在执行命令 · 已用时 20 秒"))
+        ch._tool_progress_last_notified["progress-1"] -= 120
+        await ch.send(self._message("⏳ 正在执行命令 · 已用时 2 分"))
+
+        assert ch._client.im.v1.message.create.call_count == 2
+        ch._client.im.v1.message.update.assert_not_called()
+        assert ch._tool_progress_messages["progress-1"] == "om_progress_2"
+        fresh_request = ch._client.im.v1.message.create.call_args.args[0]
+        assert json.loads(fresh_request.body.content) == {
+            "text": "⏳ 正在执行命令 · 已用时 2 分"
+        }
 
     @pytest.mark.asyncio
     async def test_completion_without_heartbeat_is_noop(self):

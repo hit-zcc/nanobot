@@ -276,6 +276,15 @@ class FeishuConfig(Base):
     group_policy: Literal["open", "mention"] = "mention"
     reply_to_message: bool = False  # If True, bot replies quote the user's original message
     streaming: bool = True
+    progress_notify_interval_s: int = Field(
+        default=120,
+        ge=0,
+        le=3600,
+        description=(
+            "Create a fresh Feishu message this often while a tool remains active. "
+            "Intermediate heartbeats still update in place; 0 disables fresh notices."
+        ),
+    )
 
 
 _STREAM_ELEMENT_ID = "streaming_md"
@@ -320,9 +329,11 @@ class FeishuChannel(BaseChannel):
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
+        self._processed_card_actions: OrderedDict[str, None] = OrderedDict()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
         self._tool_progress_messages: dict[str, str] = {}
+        self._tool_progress_last_notified: dict[str, float] = {}
         # Staleness guard: drop messages created before this channel started
         # (restart replays) or older than the threshold (in-process redelivery).
         # Feishu's at-least-once delivery can re-push old events with a fresh
@@ -376,6 +387,13 @@ class FeishuChannel(BaseChannel):
             "register_p2_im_chat_access_event_bot_p2p_chat_entered_v1",
             self._on_bot_p2p_chat_entered,
         )
+        register_card_action = getattr(builder, "register_p2_card_action_trigger", None)
+        if callable(register_card_action):
+            builder = register_card_action(self._on_card_action_sync)
+        else:
+            logger.warning(
+                "Installed lark-oapi SDK does not support card.action.trigger callbacks"
+            )
         event_handler = builder.build()
 
         # Create WebSocket client for long connection
@@ -1047,12 +1065,44 @@ class FeishuChannel(BaseChannel):
             if not existing_message_id:
                 return
             self._tool_progress_messages.pop(progress_id, None)
+            self._tool_progress_last_notified.pop(progress_id, None)
             await loop.run_in_executor(
                 None, self._update_message_sync, existing_message_id, msg.content,
             )
             return
 
+        now = time.monotonic()
         if existing_message_id:
+            notify_interval = self.config.progress_notify_interval_s
+            last_notified = self._tool_progress_last_notified.get(progress_id, now)
+            if notify_interval > 0 and now - last_notified >= notify_interval:
+                text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
+                parent_message_id = None
+                if msg.metadata.get("thread_id"):
+                    parent_message_id = (
+                        msg.metadata.get("root_id") or msg.metadata.get("message_id")
+                    )
+                if parent_message_id:
+                    sent_message_id = await loop.run_in_executor(
+                        None,
+                        self._reply_message_with_id_sync,
+                        parent_message_id,
+                        "text",
+                        text_body,
+                    )
+                else:
+                    sent_message_id = await loop.run_in_executor(
+                        None,
+                        self._send_message_sync,
+                        receive_id_type,
+                        msg.chat_id,
+                        "text",
+                        text_body,
+                    )
+                if sent_message_id:
+                    self._tool_progress_messages[progress_id] = sent_message_id
+                    self._tool_progress_last_notified[progress_id] = now
+                    return
             await loop.run_in_executor(
                 None, self._update_message_sync, existing_message_id, msg.content,
             )
@@ -1082,6 +1132,7 @@ class FeishuChannel(BaseChannel):
             )
         if sent_message_id:
             self._tool_progress_messages[progress_id] = sent_message_id
+            self._tool_progress_last_notified[progress_id] = now
 
     def _create_streaming_card_sync(
         self, receive_id_type: str, chat_id: str, reply_message_id: str | None = None
@@ -1364,6 +1415,123 @@ class FeishuChannel(BaseChannel):
         """
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+
+    @staticmethod
+    def _card_action_response(content: str, toast_type: str = "info") -> Any:
+        """Build the immediate callback response required by Feishu."""
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse,
+        )
+
+        return P2CardActionTriggerResponse({
+            "toast": {"type": toast_type, "content": content},
+        })
+
+    @staticmethod
+    def _card_action_key(data: Any) -> str:
+        """Return a stable key for callback retry/click deduplication."""
+        event = getattr(data, "event", None)
+        token = getattr(event, "token", None)
+        if token:
+            return str(token)
+        operator = getattr(event, "operator", None)
+        context = getattr(event, "context", None)
+        action = getattr(event, "action", None)
+        value = getattr(action, "value", None) or {}
+        return "|".join((
+            str(getattr(context, "open_message_id", None) or ""),
+            str(getattr(operator, "open_id", None) or ""),
+            str(getattr(action, "tag", None) or ""),
+            json.dumps(value, ensure_ascii=False, sort_keys=True, default=str),
+        ))
+
+    def _on_card_action_sync(self, data: Any) -> Any:
+        """Acknowledge a card click immediately and dispatch it asynchronously."""
+        event = getattr(data, "event", None)
+        operator = getattr(event, "operator", None)
+        sender_id = str(getattr(operator, "open_id", None) or "unknown")
+
+        if not self.is_allowed(sender_id):
+            logger.warning("Rejected Feishu card action from unauthorized user {}", sender_id)
+            return self._card_action_response("你没有权限执行这个操作", "error")
+
+        action_key = self._card_action_key(data)
+        if action_key in self._processed_card_actions:
+            return self._card_action_response("该操作已提交，请勿重复点击", "warning")
+
+        if not self._loop or not self._loop.is_running():
+            logger.error("Cannot dispatch Feishu card action: main event loop is not running")
+            return self._card_action_response("机器人暂时不可用，请稍后重试", "error")
+
+        self._processed_card_actions[action_key] = None
+        while len(self._processed_card_actions) > 1000:
+            self._processed_card_actions.popitem(last=False)
+
+        future = asyncio.run_coroutine_threadsafe(self._on_card_action(data), self._loop)
+
+        def _log_result(done: Any) -> None:
+            try:
+                done.result()
+            except Exception as exc:
+                logger.error("Error processing Feishu card action: {}", exc)
+
+        future.add_done_callback(_log_result)
+        return self._card_action_response("操作已收到，正在处理", "success")
+
+    async def _on_card_action(self, data: Any) -> None:
+        """Convert a Feishu card interaction into an inbound agent instruction."""
+        event = data.event
+        operator = getattr(event, "operator", None)
+        context = getattr(event, "context", None)
+        action = getattr(event, "action", None)
+
+        sender_id = str(getattr(operator, "open_id", None) or "unknown")
+        chat_id = str(
+            getattr(context, "open_chat_id", None)
+            or sender_id
+        )
+        message_id = str(getattr(context, "open_message_id", None) or "")
+        value = getattr(action, "value", None) or {}
+        form_value = getattr(action, "form_value", None) or {}
+
+        details = {
+            "tag": getattr(action, "tag", None),
+            "name": getattr(action, "name", None),
+            "value": value,
+            "form_value": form_value,
+            "option": getattr(action, "option", None),
+            "input_value": getattr(action, "input_value", None),
+            "options": getattr(action, "options", None),
+            "checked": getattr(action, "checked", None),
+        }
+        details = {key: val for key, val in details.items() if val not in (None, "", {}, [])}
+        details_json = json.dumps(details, ensure_ascii=False, sort_keys=True, default=str)
+        if len(details_json) > 8000:
+            details_json = details_json[:8000] + "…"
+
+        content = (
+            "[Feishu card action]\n"
+            "The user explicitly clicked an interactive card control. "
+            "Handle the selected action as the user's current instruction.\n"
+            f"Action payload: {details_json}"
+        )
+        logger.info(
+            "Feishu card action from {} in {}: {}",
+            sender_id,
+            chat_id,
+            details_json[:500],
+        )
+        await self._handle_message(
+            sender_id=sender_id,
+            chat_id=chat_id,
+            content=content,
+            metadata={
+                "message_id": message_id or None,
+                "msg_type": "card_action",
+                "card_action": details,
+                "card_action_token": getattr(event, "token", None),
+            },
+        )
 
     async def _on_message(self, data: Any) -> None:
         """Handle incoming message from Feishu."""
