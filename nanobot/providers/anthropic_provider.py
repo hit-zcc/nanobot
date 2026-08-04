@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import secrets
 import string
@@ -15,9 +16,32 @@ from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 _ALNUM = string.ascii_letters + string.digits
 
+# Anthropic's accepted shape for tool_use.id / tool_result.tool_use_id.
+_TOOL_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+_TOOL_ID_MAX = 48
+
 
 def _gen_tool_id() -> str:
     return "toolu_" + "".join(secrets.choice(_ALNUM) for _ in range(22))
+
+
+def _sanitize_tool_id(tool_id: str) -> str:
+    """Coerce a tool-call id into the shape Anthropic accepts.
+
+    Session history written by another backend can carry ids Anthropic
+    rejects — the OpenAI Codex provider, for instance, persists composite
+    ``call_x|fc_y`` ids, and the pipe fails ``^[a-zA-Z0-9_-]+$``. Replaying
+    such a history after switching models 400s the whole request.
+
+    The mapping is deterministic so a ``tool_use`` block and its matching
+    ``tool_result`` still agree after conversion, and a short digest of the
+    original keeps distinct ids distinct once illegal characters collapse.
+    """
+    if not tool_id or _TOOL_ID_RE.match(tool_id):
+        return tool_id
+    digest = hashlib.sha256(tool_id.encode("utf-8", "replace")).hexdigest()[:8]
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]", "_", tool_id)[:_TOOL_ID_MAX]
+    return f"{cleaned}_{digest}"
 
 
 class AnthropicProvider(LLMProvider):
@@ -106,7 +130,7 @@ class AnthropicProvider(LLMProvider):
         content = msg.get("content")
         block: dict[str, Any] = {
             "type": "tool_result",
-            "tool_use_id": msg.get("tool_call_id", ""),
+            "tool_use_id": _sanitize_tool_id(msg.get("tool_call_id", "")),
         }
         if isinstance(content, (str, list)):
             block["content"] = content
@@ -142,7 +166,7 @@ class AnthropicProvider(LLMProvider):
                 args = json_repair.loads(args)
             blocks.append({
                 "type": "tool_use",
-                "id": tc.get("id") or _gen_tool_id(),
+                "id": _sanitize_tool_id(tc.get("id") or "") or _gen_tool_id(),
                 "name": func.get("name", ""),
                 "input": args,
             })
@@ -287,16 +311,20 @@ class AnthropicProvider(LLMProvider):
     # System-prefix hook (overridden by the Claude OAuth subclass)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _supports_temperature(model_name: str) -> bool:
-        """Newer Claude models deprecate the ``temperature`` param.
+    # Models that use adaptive thinking + ``output_config.effort`` instead of a
+    # fixed ``budget_tokens`` budget. They also reject ``temperature`` with a
+    # 400 ``invalid_request_error`` ("`temperature` is deprecated for this
+    # model"), and they think by default even when no effort is requested.
+    _ADAPTIVE_MARKERS = (
+        "fable", "mythos", "opus-5", "sonnet-5", "opus-4-7", "opus-4-8",
+    )
+    _EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
-        Covers the Claude 5-class models (Fable 5, Mythos 5) as well as the
-        Opus 4.8 generation (``claude-opus-4-8``), which all reject
-        ``temperature`` with a 400 ``invalid_request_error``.
-        """
+    @classmethod
+    def _uses_adaptive_thinking(cls, model_name: str) -> bool:
+        """Whether *model_name* belongs to the adaptive-thinking generation."""
         m = model_name.lower()
-        return not ("fable" in m or "mythos" in m or "opus-4-8" in m)
+        return any(marker in m for marker in cls._ADAPTIVE_MARKERS)
 
     def _system_prefix(self) -> str | None:
         """Subclasses override to force a required first system block.
@@ -357,7 +385,10 @@ class AnthropicProvider(LLMProvider):
             )
 
         max_tokens = max(1, max_tokens)
-        thinking_enabled = bool(reasoning_effort)
+        adaptive = self._uses_adaptive_thinking(model_name)
+        # Adaptive-generation models think by default, so tool_choice must stay
+        # "auto" for them even when no effort was configured.
+        thinking_enabled = adaptive or bool(reasoning_effort)
 
         kwargs: dict[str, Any] = {
             "model": model_name,
@@ -368,15 +399,21 @@ class AnthropicProvider(LLMProvider):
         if system:
             kwargs["system"] = system
 
-        supports_temperature = self._supports_temperature(model_name)
-        if thinking_enabled:
+        if adaptive:
+            # `budget_tokens` is removed on this generation; depth is steered by
+            # output_config.effort instead. max_tokens is left alone — it caps
+            # thinking plus response text together.
+            kwargs["thinking"] = {"type": "adaptive"}
+            effort = (reasoning_effort or "").lower()
+            if effort in self._EFFORT_LEVELS:
+                kwargs["output_config"] = {"effort": effort}
+        elif reasoning_effort:
             budget_map = {"low": 1024, "medium": 4096, "high": max(8192, max_tokens)}
-            budget = budget_map.get(reasoning_effort.lower(), 4096)  # type: ignore[union-attr]
+            budget = budget_map.get(reasoning_effort.lower(), 4096)
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             kwargs["max_tokens"] = max(max_tokens, budget + 4096)
-            if supports_temperature:
-                kwargs["temperature"] = 1.0
-        elif supports_temperature:
+            kwargs["temperature"] = 1.0
+        else:
             kwargs["temperature"] = temperature
 
         if anthropic_tools:

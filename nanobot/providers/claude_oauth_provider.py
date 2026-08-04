@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import subprocess
+import sys
 import time
 import webbrowser
 from collections.abc import Awaitable, Callable
@@ -42,48 +44,173 @@ def _claude_code_credentials_path() -> Path:
     return Path.home() / ".claude" / ".credentials.json"
 
 
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+# Where a borrowed Claude Code token came from, so a refresh can be written
+# back to the same store instead of orphaning it.
+SOURCE_KEYCHAIN = "claude_code_keychain"
+SOURCE_CC_FILE = "claude_code_file"
+
+
+def _read_claude_code_keychain() -> str | None:
+    """Return the raw Claude Code credentials JSON from the macOS Keychain."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _keychain_account() -> str | None:
+    """Return the account name of the Claude Code keychain item."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if '"acct"<blob>=' in line:
+            _, _, value = line.partition('"acct"<blob>=')
+            value = value.strip()
+            return value[1:-1] if value.startswith('"') and value.endswith('"') else None
+    return None
+
+
+def _write_claude_code_keychain(raw: str) -> bool:
+    """Replace the Claude Code keychain item's payload with *raw*."""
+    account = _keychain_account()
+    if account is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["security", "add-generic-password", "-U",
+             "-s", KEYCHAIN_SERVICE, "-a", account, "-w", raw],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
+def _merge_claude_code_credentials(raw: str, token_data: dict[str, Any]) -> str | None:
+    """Fold refreshed tokens into Claude Code's blob, preserving its other keys.
+
+    Claude Code keeps fields nanobot doesn't model (``subscriptionType``,
+    ``scopes``, ``rateLimitTier``, …); those must survive a write-back or the
+    ``claude`` CLI loses state.
+    """
+    try:
+        blob = json.loads(raw)
+    except Exception:
+        return None
+    oauth = blob.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    oauth["accessToken"] = token_data["access_token"]
+    if token_data.get("refresh_token"):
+        oauth["refreshToken"] = token_data["refresh_token"]
+    # Claude Code stores expiresAt in milliseconds.
+    oauth["expiresAt"] = int(token_data["expires_at"] * 1000)
+    return json.dumps(blob)
+
+
+def _persist_to_claude_code(token_data: dict[str, Any], source: str) -> bool:
+    """Write refreshed tokens back to whichever Claude Code store they came from."""
+    if source == SOURCE_KEYCHAIN:
+        raw = _read_claude_code_keychain()
+        merged = _merge_claude_code_credentials(raw, token_data) if raw else None
+        return _write_claude_code_keychain(merged) if merged else False
+
+    if source == SOURCE_CC_FILE:
+        path = _claude_code_credentials_path()
+        try:
+            merged = _merge_claude_code_credentials(path.read_text(), token_data)
+            if not merged:
+                return False
+            path.write_text(merged)
+            return True
+        except Exception:
+            return False
+
+    return False
+
+
+def _parse_claude_code_credentials(raw: str, source: str) -> dict[str, Any] | None:
+    """Parse Claude Code's credentials blob into our token dict shape."""
+    try:
+        oauth = (json.loads(raw).get("claudeAiOauth") or {})
+    except Exception:
+        return None
+    access_token = oauth.get("accessToken")
+    if not access_token:
+        return None
+    expires_at = oauth.get("expiresAt")
+    # Claude Code stores expiresAt in milliseconds.
+    return {
+        "access_token": access_token,
+        "refresh_token": oauth.get("refreshToken", ""),
+        "expires_at": float(expires_at) / 1000.0 if expires_at else 0.0,
+        "token_type": "Bearer",
+        "source": source,
+    }
+
+
 def _load_claude_code_token() -> dict[str, Any] | None:
     """Load OAuth token from Claude Code's own credentials, if present.
 
     Claude Code stores ``{"claudeAiOauth": {"accessToken", "refreshToken",
-    "expiresAt", ...}}`` with ``expiresAt`` in milliseconds. This is a
-    read-only fallback so users who already ran ``claude`` login don't need a
-    separate ``nanobot provider login claude-oauth``. macOS Keychain storage
-    is not read here.
+    "expiresAt", ...}}`` with ``expiresAt`` in milliseconds — in
+    ``~/.claude/.credentials.json`` on headless installs, and in the login
+    Keychain on macOS. Sharing it means users who already ran ``claude`` login
+    don't need a separate ``nanobot provider login claude-oauth``; refreshes
+    are written back so both stay on the same token chain.
     """
     path = _claude_code_credentials_path()
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text())
-        oauth = data.get("claudeAiOauth") or {}
-        access_token = oauth.get("accessToken")
-        if not access_token:
-            return None
-        expires_at = oauth.get("expiresAt")
-        # Claude Code stores expiresAt in milliseconds.
-        expires_at = float(expires_at) / 1000.0 if expires_at else 0.0
-        return {
-            "access_token": access_token,
-            "refresh_token": oauth.get("refreshToken", ""),
-            "expires_at": expires_at,
-            "token_type": "Bearer",
-        }
-    except Exception:
-        return None
+    if path.exists():
+        try:
+            if token := _parse_claude_code_credentials(path.read_text(), SOURCE_CC_FILE):
+                return token
+        except Exception:
+            pass
+    raw = _read_claude_code_keychain()
+    return _parse_claude_code_credentials(raw, SOURCE_KEYCHAIN) if raw else None
 
 
 def _load_token() -> dict[str, Any] | None:
-    """Load persisted OAuth token, falling back to Claude Code's credentials."""
+    """Load persisted OAuth token, falling back to Claude Code's credentials.
+
+    A stored token whose refresh token has been revoked is worse than no token
+    at all, so an expired-and-unrefreshable local token yields to Claude Code's
+    credentials when those are still live.
+    """
+    fallback = None
     path = _token_path()
     if path.exists():
         try:
             data = json.loads(path.read_text())
             if data.get("access_token"):
-                return data
+                if time.time() < data.get("expires_at", 0) - _EXPIRY_SKEW_SECONDS:
+                    return data
+                fallback = data
         except Exception:
             pass
-    return _load_claude_code_token()
+
+    claude_code = _load_claude_code_token()
+    if claude_code and time.time() < claude_code.get("expires_at", 0) - _EXPIRY_SKEW_SECONDS:
+        return claude_code
+    # Nothing is currently valid — hand back whatever can still be refreshed.
+    return fallback or claude_code
 
 
 def _save_token(data: dict[str, Any]) -> None:
@@ -105,8 +232,14 @@ def get_claude_oauth_login_status() -> dict[str, Any] | None:
     return _load_token()
 
 
-def _refresh_access_token(refresh_token: str) -> dict[str, Any]:
-    """Exchange a refresh token for a new access token."""
+def _refresh_access_token(refresh_token: str, source: str | None = None) -> dict[str, Any]:
+    """Exchange a refresh token for a new access token.
+
+    *source* says which store the refresh token was read from. Anthropic
+    rotates refresh tokens, so a token borrowed from Claude Code must be
+    written back to Claude Code's own store — otherwise the rotation would
+    silently invalidate the copy the ``claude`` CLI still holds.
+    """
     timeout = httpx.Timeout(20.0, connect=20.0)
     with httpx.Client(timeout=timeout, follow_redirects=False) as client:
         resp = client.post(
@@ -136,6 +269,17 @@ def _refresh_access_token(refresh_token: str) -> dict[str, Any]:
         "expires_at": now + expires_in,
         "token_type": payload.get("token_type", "Bearer"),
     }
+
+    if source in (SOURCE_KEYCHAIN, SOURCE_CC_FILE):
+        if _persist_to_claude_code(token_data, source):
+            return {**token_data, "source": source}
+        # Write-back failed: keep the rotated token in nanobot's own store so
+        # this process stays usable, and warn that `claude` may need a re-login.
+        logger.warning(
+            "Refreshed a Claude Code OAuth token but could not write it back to "
+            "{}; the `claude` CLI may need to log in again.", source,
+        )
+
     _save_token(token_data)
     return token_data
 
@@ -332,7 +476,9 @@ class ClaudeOAuthProvider(AnthropicProvider):
             self._oauth_expires_at = expires_at
             return self._oauth_token
 
-        # Try to refresh
+        # Try to refresh. A token borrowed from Claude Code is refreshed in
+        # place: the rotated pair is written back to Claude Code's own store so
+        # nanobot and the `claude` CLI stay on one shared token chain.
         refresh_token = token_data.get("refresh_token")
         if not refresh_token:
             raise RuntimeError(
@@ -342,7 +488,7 @@ class ClaudeOAuthProvider(AnthropicProvider):
 
         logger.debug("Refreshing Claude OAuth token...")
         try:
-            new_data = _refresh_access_token(refresh_token)
+            new_data = _refresh_access_token(refresh_token, token_data.get("source"))
             self._oauth_token = new_data["access_token"]
             self._oauth_expires_at = new_data["expires_at"]
             return self._oauth_token

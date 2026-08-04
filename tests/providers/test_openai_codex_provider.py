@@ -9,8 +9,10 @@ from nanobot.providers.base import ToolCallRequest
 from nanobot.providers.codex_credentials import CodexCredentialError, CodexCredentials
 from nanobot.providers.openai_codex_provider import (
     _CONTINUATION_CACHE_LIMIT,
+    _CONTINUATION_CACHE_TTL_SECONDS,
     OpenAICodexProvider,
     _CodexHTTPError,
+    _CodexResponseError,
     _consume_sse,
     _request_codex,
 )
@@ -313,6 +315,64 @@ async def test_continuation_cache_is_bounded(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_continuation_cache_survives_ten_minute_tool_run(monkeypatch):
+    assert _CONTINUATION_CACHE_TTL_SECONDS == 900.0
+    now = 100.0
+    marker = "long-running-tool-encrypted-reasoning"
+    tool_call = ToolCallRequest(id="call_long|fc_long", name="exec", arguments={})
+    request_bodies = []
+
+    async def request(url, headers, body, on_content_delta=None):
+        request_bodies.append(body)
+        if len(request_bodies) == 1:
+            return (
+                "",
+                [tool_call],
+                "stop",
+                [
+                    {"id": "rs_long", "type": "reasoning", "encrypted_content": marker},
+                    {
+                        "id": "fc_long",
+                        "type": "function_call",
+                        "call_id": "call_long",
+                        "name": "exec",
+                        "arguments": "{}",
+                    },
+                ],
+            )
+        return "done", [], "stop", []
+
+    monkeypatch.setattr(
+        "nanobot.providers.openai_codex_provider.time.monotonic",
+        lambda: now,
+    )
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", request)
+    provider = OpenAICodexProvider(credential_manager=FakeCredentials())
+    initial_messages = [{"role": "user", "content": "inspect"}]
+
+    await provider.chat(initial_messages)
+    now += 600.0
+    await provider.chat(
+        [
+            *initial_messages,
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [tool_call.to_openai_tool_call()],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "name": tool_call.name,
+                "content": "tool result",
+            },
+        ]
+    )
+
+    assert marker in json.dumps(request_bodies[1]["input"])
+
+
+@pytest.mark.asyncio
 async def test_nested_forced_tool_choice_is_sent_in_flat_responses_shape(monkeypatch):
     provider = OpenAICodexProvider(credential_manager=FakeCredentials())
     seen_body = None
@@ -409,6 +469,90 @@ async def test_timeout_is_safely_classified_and_retried(monkeypatch):
     assert result.content == "ok"
     assert request_count == 2
     assert delays == [1]
+
+
+@pytest.mark.asyncio
+async def test_response_failure_is_safely_logged_and_retried(monkeypatch):
+    provider = OpenAICodexProvider(credential_manager=FakeCredentials())
+    request_count = 0
+    delays = []
+    warnings = []
+    secret = "synthetic-secret-response-message"
+
+    class FakeSSE:
+        async def aiter_lines(self):
+            event = {
+                "type": "response.failed",
+                "response": {
+                    "id": "resp_safe_123",
+                    "error": {
+                        "code": "server_error",
+                        "message": secret,
+                    },
+                },
+            }
+            yield f"data: {json.dumps(event)}"
+            yield ""
+
+    async def request(url, headers, body, on_content_delta=None):
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            return await _consume_sse(FakeSSE(), on_content_delta)
+        return "ok", [], "stop", []
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    def capture_warning(message, *args):
+        warnings.append((message, args))
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", request)
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider.logger.warning", capture_warning)
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", fake_sleep)
+
+    result = await provider.chat_with_retry(messages=[{"role": "user", "content": "hi"}])
+
+    assert result.content == "ok"
+    assert request_count == 2
+    assert delays == [1]
+    assert warnings[0] == (
+        "Codex response failed (event_type={}, code={}, request_id={})",
+        ("response.failed", "server_error", "resp_safe_123"),
+    )
+    assert warnings[1] == (
+        "LLM transient error (attempt {}/{}), retrying in {}s: {}",
+        (
+            1,
+            3,
+            1,
+            "error calling codex: response failed",
+        ),
+    )
+    assert secret not in repr(warnings)
+
+
+@pytest.mark.asyncio
+async def test_response_failure_discards_unsafe_diagnostic_fields():
+    secret = "Bearer synthetic-secret"
+
+    class FakeSSE:
+        async def aiter_lines(self):
+            event = {
+                "type": "error",
+                "request_id": secret,
+                "error": {"code": secret, "message": secret},
+            }
+            yield f"data: {json.dumps(event)}"
+            yield ""
+
+    with pytest.raises(_CodexResponseError) as raised:
+        await _consume_sse(FakeSSE())
+
+    assert raised.value.event_type == "error"
+    assert raised.value.code is None
+    assert raised.value.request_id is None
+    assert secret not in str(raised.value)
 
 
 @pytest.mark.asyncio

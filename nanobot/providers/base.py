@@ -50,7 +50,7 @@ class LLMResponse:
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
     response_model: str | None = None  # actual model name echoed by the API
-    
+
     @property
     def has_tool_calls(self) -> bool:
         """Check if response contains tool calls."""
@@ -75,7 +75,7 @@ class GenerationSettings:
 class LLMProvider(ABC):
     """
     Abstract base class for LLM providers.
-    
+
     Implementations should handle the specifics of each provider's API
     while maintaining a consistent interface.
     """
@@ -92,6 +92,7 @@ class LLMProvider(ABC):
         "timeout",
         "timed out",
         "connection",
+        "codex: response failed",
         "server error",
         "temporarily unavailable",
     )
@@ -179,7 +180,7 @@ class LLMProvider(ABC):
     ) -> LLMResponse:
         """
         Send a chat completion request.
-        
+
         Args:
             messages: List of message dicts with 'role' and 'content'.
             tools: Optional list of tool definitions.
@@ -187,7 +188,7 @@ class LLMProvider(ABC):
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
             tool_choice: Tool selection strategy ("auto", "required", or specific tool dict).
-        
+
         Returns:
             LLMResponse with content and/or tool calls.
         """

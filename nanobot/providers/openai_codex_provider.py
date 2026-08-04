@@ -19,7 +19,7 @@ DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "nanobot"
 _CODEX_TIMEOUT = httpx.Timeout(connect=20.0, read=300.0, write=60.0, pool=20.0)
 _CONTINUATION_CACHE_LIMIT = 32
-_CONTINUATION_CACHE_TTL_SECONDS = 300.0
+_CONTINUATION_CACHE_TTL_SECONDS = 900.0
 
 ContinuationKey = tuple[str, tuple[str, ...]]
 
@@ -28,6 +28,21 @@ class _CodexHTTPError(RuntimeError):
     def __init__(self, status_code: int, message: str):
         super().__init__(message)
         self.status_code = status_code
+
+
+class _CodexResponseError(RuntimeError):
+    """A safely summarized failure reported inside a successful SSE connection."""
+
+    def __init__(
+        self,
+        event_type: str,
+        code: str | None = None,
+        request_id: str | None = None,
+    ):
+        super().__init__("Codex response failed")
+        self.event_type = event_type
+        self.code = code
+        self.request_id = request_id
 
 
 class OpenAICodexProvider(LLMProvider):
@@ -183,6 +198,14 @@ class OpenAICodexProvider(LLMProvider):
         except httpx.TransportError as exc:
             logger.warning("Codex connection failed ({})", type(exc).__name__)
             return LLMResponse(content="Error calling Codex: connection failed", finish_reason="error")
+        except _CodexResponseError as exc:
+            logger.warning(
+                "Codex response failed (event_type={}, code={}, request_id={})",
+                exc.event_type,
+                exc.code or "unknown",
+                exc.request_id or "unknown",
+            )
+            return LLMResponse(content="Error calling Codex: response failed", finish_reason="error")
         except Exception:
             return LLMResponse(content="Error calling Codex: request failed", finish_reason="error")
 
@@ -419,7 +442,7 @@ async def _consume_sse(
             status = (event.get("response") or {}).get("status")
             finish_reason = _map_finish_reason(status)
         elif event_type in {"error", "response.failed"}:
-            raise RuntimeError("Codex response failed")
+            raise _codex_response_error(event, event_type)
 
     completed_output.sort(key=lambda entry: (entry[0], entry[1]))
     output_items: list[dict[str, Any]] = []
@@ -456,6 +479,28 @@ _FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "er
 
 def _map_finish_reason(status: str | None) -> str:
     return _FINISH_REASON_MAP.get(status or "completed", "stop")
+
+
+def _codex_response_error(event: dict[str, Any], event_type: str) -> _CodexResponseError:
+    response = event.get("response")
+    response = response if isinstance(response, dict) else {}
+    error = event.get("error")
+    if not isinstance(error, dict):
+        error = response.get("error")
+    error = error if isinstance(error, dict) else {}
+    code = _safe_diagnostic_value(error.get("code") or error.get("type"))
+    request_id = _safe_diagnostic_value(
+        event.get("request_id") or response.get("id") or error.get("request_id")
+    )
+    return _CodexResponseError(event_type, code, request_id)
+
+
+def _safe_diagnostic_value(value: Any) -> str | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= 128:
+        return None
+    if not all(char.isalnum() or char in "._:-" for char in value):
+        return None
+    return value
 
 
 def _friendly_error(status_code: int, _raw: str) -> str:
