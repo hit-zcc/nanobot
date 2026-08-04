@@ -49,6 +49,26 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 16_000
+    _BACKGROUND_STATUS_QUERIES = {
+        "咋样了",
+        "怎么样了",
+        "进度",
+        "进度咋样",
+        "进度怎么样",
+        "任务咋样了",
+        "任务怎么样了",
+        "后台任务咋样了",
+        "后台任务怎么样了",
+        "看看任务咋样了",
+        "看看任务怎么样了",
+        "看看进度",
+        "现在咋样了",
+        "现在怎么样了",
+        "嗯咋样了",
+        "到哪了",
+        "好了吗",
+        "完成了吗",
+    }
     _TOOL_DISPLAY_NAMES = {
         "exec": "执行命令",
         "read_file": "读取文件",
@@ -436,16 +456,31 @@ class AgentLoop:
                 if result:
                     await self.bus.publish_outbound(result)
                 continue
-            if self._coalesce_window > 0:
+            # System notifications are independent turns.  They may target the
+            # same session as a user message, but must queue behind it rather
+            # than being merged into the user's text burst.
+            if self._coalesce_window > 0 and msg.channel != "system":
                 self._buffer_inbound(msg)
             else:
                 self._spawn_dispatch(msg)
 
+    @staticmethod
+    def _dispatch_session_key(msg: InboundMessage) -> str:
+        """Resolve the conversation key used for locking and task tracking."""
+        if msg.session_key_override:
+            return msg.session_key_override
+        if msg.channel == "system" and ":" in msg.chat_id:
+            # Defensive compatibility for system producers that encode their
+            # target as "channel:chat_id" but omit an explicit override.
+            return msg.chat_id
+        return msg.session_key
+
     def _spawn_dispatch(self, msg: InboundMessage) -> None:
         """Dispatch a (possibly merged) message as a tracked, cancellable task."""
         task = asyncio.create_task(self._dispatch(msg))
-        self._active_tasks.setdefault(msg.session_key, []).append(task)
-        task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+        key = self._dispatch_session_key(msg)
+        self._active_tasks.setdefault(key, []).append(task)
+        task.add_done_callback(lambda t, k=key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
 
     def _buffer_inbound(self, msg: InboundMessage) -> None:
         """Buffer a message and (re)start the per-session coalesce timer.
@@ -453,7 +488,7 @@ class AgentLoop:
         Each new message in the same session slides the window, so a burst is
         only flushed once `self._coalesce_window` seconds of quiet have passed.
         """
-        key = msg.session_key
+        key = self._dispatch_session_key(msg)
         self._inbound_buffer.setdefault(key, []).append(msg)
         if old := self._debounce_tasks.get(key):
             old.cancel()
@@ -496,7 +531,8 @@ class AgentLoop:
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
-        lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
+        dispatch_key = self._dispatch_session_key(msg)
+        lock = self._session_locks.setdefault(dispatch_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
         async with lock, gate:
             try:
@@ -553,7 +589,7 @@ class AgentLoop:
                         content="", metadata=msg.metadata or {},
                     ))
             except asyncio.CancelledError:
-                logger.info("Task cancelled for session {}", msg.session_key)
+                logger.info("Task cancelled for session {}", dispatch_key)
                 raise
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
@@ -636,6 +672,17 @@ class AgentLoop:
         if result := await self.commands.dispatch(ctx):
             return result
 
+        normalized_raw = "".join(raw.split()).rstrip("？?！!。")
+        if normalized_raw in self._BACKGROUND_STATUS_QUERIES:
+            status = self.subagents.format_session_status(key)
+            if isinstance(status, str) and status:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=status,
+                    metadata=dict(msg.metadata or {}),
+                )
+
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
@@ -644,11 +691,15 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=0)
+        background_context = self.subagents.format_session_context(key)
+        if not isinstance(background_context, str):
+            background_context = None
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
+            runtime_metadata=background_context,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:

@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -24,8 +26,40 @@ if TYPE_CHECKING:
     from nanobot.config.schema import WebSearchConfig
 
 
+@dataclass(slots=True)
+class SubagentTaskState:
+    """Observable runtime state for one background task."""
+
+    task_id: str
+    label: str
+    task: str
+    origin_channel: str
+    origin_chat_id: str
+    session_key: str
+    started_at: float = field(default_factory=time.monotonic)
+    updated_at: float = field(default_factory=time.monotonic)
+    status: str = "running"
+    phase: str = "正在启动"
+    iteration: int = 0
+    completed_tools: int = 0
+    current_tools: list[str] = field(default_factory=list)
+    progress_sent: bool = False
+
+
 class SubagentManager:
     """Manages background subagent execution."""
+
+    _PROGRESS_FIRST_SECONDS = 20.0
+    _PROGRESS_INTERVAL_SECONDS = 60.0
+    _MAX_RETAINED_STATES = 64
+    _TOOL_LABELS = {
+        "read_file": "读取代码",
+        "write_file": "写入文件",
+        "edit_file": "修改代码",
+        "list_dir": "浏览目录",
+        "web_search": "搜索资料",
+        "web_fetch": "读取网页",
+    }
 
     def __init__(
         self,
@@ -53,6 +87,7 @@ class SubagentManager:
         self.runner = AgentRunner(provider)
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
+        self._task_states: dict[str, SubagentTaskState] = {}
 
     async def spawn(
         self,
@@ -66,20 +101,32 @@ class SubagentManager:
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
+        resolved_session_key = session_key or f"{origin_channel}:{origin_chat_id}"
+        self._prune_task_states()
+        self._task_states[task_id] = SubagentTaskState(
+            task_id=task_id,
+            label=display_label,
+            task=task,
+            origin_channel=origin_channel,
+            origin_chat_id=origin_chat_id,
+            session_key=resolved_session_key,
+        )
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin)
+            self._run_subagent(
+                task_id, task, display_label, origin,
+                session_key=resolved_session_key,
+            )
         )
         self._running_tasks[task_id] = bg_task
-        if session_key:
-            self._session_tasks.setdefault(session_key, set()).add(task_id)
+        self._session_tasks.setdefault(resolved_session_key, set()).add(task_id)
 
         def _cleanup(_: asyncio.Task) -> None:
             self._running_tasks.pop(task_id, None)
-            if session_key and (ids := self._session_tasks.get(session_key)):
+            if ids := self._session_tasks.get(resolved_session_key):
                 ids.discard(task_id)
                 if not ids:
-                    del self._session_tasks[session_key]
+                    del self._session_tasks[resolved_session_key]
 
         bg_task.add_done_callback(_cleanup)
 
@@ -92,9 +139,22 @@ class SubagentManager:
         task: str,
         label: str,
         origin: dict[str, str],
+        session_key: str | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
+        state = self._task_states.setdefault(
+            task_id,
+            SubagentTaskState(
+                task_id=task_id,
+                label=label,
+                task=task,
+                origin_channel=origin["channel"],
+                origin_chat_id=origin["chat_id"],
+                session_key=session_key or f"{origin['channel']}:{origin['chat_id']}",
+            ),
+        )
+        progress_task = asyncio.create_task(self._progress_heartbeat(task_id))
 
         try:
             # Build subagent tools (no message tool, no spawn tool)
@@ -122,10 +182,49 @@ class SubagentManager:
             manager = self
 
             class _SubagentHook(AgentHook):
+                async def before_iteration(self, context: AgentHookContext) -> None:
+                    manager._update_state(
+                        task_id,
+                        phase="正在分析下一步",
+                        iteration=context.iteration + 1,
+                        current_tools=[],
+                    )
+
                 async def before_execute_tools(self, context: AgentHookContext) -> None:
+                    manager._update_state(
+                        task_id,
+                        phase="正在执行工具",
+                        current_tools=[
+                            manager._describe_tool_call(tool_call)
+                            for tool_call in context.tool_calls
+                        ],
+                    )
                     for tool_call in context.tool_calls:
                         args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                         logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
+
+                async def on_tool_heartbeat(
+                    self,
+                    context: AgentHookContext,
+                    *,
+                    elapsed: float,
+                    pending: list[str],
+                ) -> None:
+                    manager._update_state(
+                        task_id,
+                        phase="工具仍在运行",
+                    )
+
+                async def after_iteration(self, context: AgentHookContext) -> None:
+                    if context.tool_events:
+                        manager._update_state(
+                            task_id,
+                            phase="正在整理工具结果",
+                            completed_tools=(
+                                state.completed_tools + len(context.tool_events)
+                            ),
+                            current_tools=[],
+                        )
 
                 async def on_notice(self, context: AgentHookContext, message: str) -> None:
                     await manager.bus.publish_outbound(OutboundMessage(
@@ -155,6 +254,7 @@ class SubagentManager:
                 fail_on_tool_error=True,
             ))
             if result.stop_reason == "tool_error":
+                await self._finish_state(task_id, "failed")
                 await self._announce_result(
                     task_id,
                     label,
@@ -165,6 +265,7 @@ class SubagentManager:
                 )
                 return
             if result.stop_reason == "error":
+                await self._finish_state(task_id, "failed")
                 await self._announce_result(
                     task_id,
                     label,
@@ -175,6 +276,7 @@ class SubagentManager:
                 )
                 return
             if result.stop_reason == "max_iterations":
+                await self._finish_state(task_id, "failed")
                 await self._announce_result(
                     task_id,
                     label,
@@ -187,12 +289,178 @@ class SubagentManager:
             final_result = result.final_content or "Task completed but no final response was generated."
 
             logger.info("Subagent [{}] completed successfully", task_id)
+            await self._finish_state(task_id, "completed")
             await self._announce_result(task_id, label, task, final_result, origin, "ok")
 
+        except asyncio.CancelledError:
+            await self._finish_state(task_id, "cancelled")
+            raise
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             logger.error("Subagent [{}] failed: {}", task_id, e)
+            await self._finish_state(task_id, "failed")
             await self._announce_result(task_id, label, task, error_msg, origin, "error")
+        finally:
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
+
+    def _update_state(self, task_id: str, **changes: Any) -> None:
+        state = self._task_states.get(task_id)
+        if state is None:
+            return
+        for name, value in changes.items():
+            setattr(state, name, value)
+        state.updated_at = time.monotonic()
+
+    async def _finish_state(self, task_id: str, status: str) -> None:
+        state = self._task_states.get(task_id)
+        if state is None or state.status != "running":
+            return
+        self._update_state(
+            task_id,
+            status=status,
+            phase={
+                "completed": "已完成",
+                "failed": "执行失败",
+                "cancelled": "已取消",
+            }.get(status, status),
+            current_tools=[],
+        )
+        if state.progress_sent:
+            await self._publish_progress(state, done=True)
+
+    async def _progress_heartbeat(self, task_id: str) -> None:
+        try:
+            await asyncio.sleep(self._PROGRESS_FIRST_SECONDS)
+            while True:
+                state = self._task_states.get(task_id)
+                if state is None or state.status != "running":
+                    return
+                await self._publish_progress(state, done=False)
+                await asyncio.sleep(self._PROGRESS_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Subagent [{}] progress heartbeat failed", task_id)
+
+    async def _publish_progress(self, state: SubagentTaskState, *, done: bool) -> None:
+        content = self._format_state(state, include_id=False)
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=state.origin_channel,
+            chat_id=state.origin_chat_id,
+            content=content,
+            metadata={
+                "_progress": True,
+                "_tool_progress_id": f"subagent-progress:{state.task_id}",
+                "_tool_progress_done": done,
+            },
+        ))
+        if not done:
+            state.progress_sent = True
+
+    @classmethod
+    def _describe_tool_call(cls, tool_call: Any) -> str:
+        name = getattr(tool_call, "name", "")
+        if name != "exec":
+            return cls._TOOL_LABELS.get(name, name or "处理任务")
+        arguments = getattr(tool_call, "arguments", {}) or {}
+        command = str(arguments.get("command", "")).lower()
+        if "mvn " in command or "mvnw " in command:
+            return "运行 Maven 编译/测试"
+        if "gradle" in command:
+            return "运行 Gradle 编译/测试"
+        if "pytest" in command or " test" in command:
+            return "运行测试"
+        if "git " in command:
+            return "检查或更新代码"
+        if "javap" in command or "grep" in command or "find " in command:
+            return "分析代码与依赖"
+        return "执行命令"
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        total = max(0, int(seconds))
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours}小时{minutes}分"
+        if minutes:
+            return f"{minutes}分{secs}秒"
+        return f"{secs}秒"
+
+    @classmethod
+    def _format_state(cls, state: SubagentTaskState, *, include_id: bool) -> str:
+        elapsed = cls._format_elapsed(time.monotonic() - state.started_at)
+        prefix = {
+            "running": "⏳",
+            "completed": "✅",
+            "failed": "❌",
+            "cancelled": "⏹️",
+        }.get(state.status, "•")
+        identifier = f" `{state.task_id}`" if include_id else ""
+        lines = [f"{prefix} 后台任务「{state.label}」{identifier}"]
+        if state.status == "running":
+            lines.append(f"状态：运行中 · 已用时 {elapsed} · 第 {state.iteration} 轮")
+        else:
+            lines.append(f"状态：{state.phase} · 共用时 {elapsed}")
+        phase = "、".join(state.current_tools) if state.current_tools else state.phase
+        lines.append(f"当前：{phase}")
+        lines.append(f"已完成工具步骤：{state.completed_tools}")
+        return "\n".join(lines)
+
+    def get_session_states(
+        self,
+        session_key: str,
+        *,
+        running_only: bool = True,
+    ) -> list[SubagentTaskState]:
+        states = [
+            state for state in self._task_states.values()
+            if state.session_key == session_key
+            and (not running_only or state.status == "running")
+        ]
+        return sorted(states, key=lambda state: state.started_at)
+
+    def format_session_status(self, session_key: str) -> str | None:
+        states = self.get_session_states(session_key)
+        if not states:
+            return None
+        header = "当前后台任务："
+        return "\n\n".join([header, *[
+            self._format_state(state, include_id=True)
+            for state in states
+        ]])
+
+    def format_session_context(self, session_key: str) -> str | None:
+        states = self.get_session_states(session_key)
+        if not states:
+            return None
+        lines = ["Active Background Tasks (authoritative runtime state):"]
+        for state in states:
+            elapsed = self._format_elapsed(time.monotonic() - state.started_at)
+            tools = ", ".join(state.current_tools) or state.phase
+            lines.append(
+                f"- id={state.task_id}; label={state.label}; status=running; "
+                f"elapsed={elapsed}; iteration={state.iteration}; "
+                f"current={tools}; completed_tool_steps={state.completed_tools}"
+            )
+        return "\n".join(lines)
+
+    def _prune_task_states(self) -> None:
+        if len(self._task_states) < self._MAX_RETAINED_STATES:
+            return
+        completed = sorted(
+            (
+                state for state in self._task_states.values()
+                if state.status != "running"
+            ),
+            key=lambda state: state.updated_at,
+        )
+        for state in completed[:max(1, len(self._task_states) // 4)]:
+            self._task_states.pop(state.task_id, None)
 
     async def _announce_result(
         self,
@@ -221,6 +489,16 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
             sender_id="subagent",
             chat_id=f"{origin['channel']}:{origin['chat_id']}",
             content=announce_content,
+            # The dispatcher must lock the real conversation from the moment
+            # this message enters the bus.  Without the override it locks
+            # "system:<origin>" while _process_message later writes to
+            # "<origin>", allowing a user turn and this completion turn to
+            # mutate the same session concurrently.
+            session_key_override=(
+                self._task_states[task_id].session_key
+                if task_id in self._task_states
+                else f"{origin['channel']}:{origin['chat_id']}"
+            ),
         )
 
         await self.bus.publish_inbound(msg)

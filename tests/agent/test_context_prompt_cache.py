@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import datetime as datetime_module
 from datetime import datetime as real_datetime
 from importlib.resources import files as pkg_files
 from pathlib import Path
-import datetime as datetime_module
 
 from nanobot.agent.context import ContextBuilder
 
@@ -71,3 +71,21 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert "Channel: cli" in user_content
     assert "Chat ID: direct" in user_content
     assert "Return exactly: OK" in user_content
+
+
+def test_runtime_context_can_include_active_background_task_metadata(tmp_path):
+    builder = ContextBuilder(tmp_path)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="咋样了",
+        channel="feishu.jarvis",
+        chat_id="u1",
+        runtime_metadata=(
+            "Active Background Tasks (authoritative runtime state):\n"
+            "- id=sub-1; label=重构; status=running"
+        ),
+    )
+
+    assert "Active Background Tasks" in messages[-1]["content"]
+    assert "id=sub-1" in messages[-1]["content"]
