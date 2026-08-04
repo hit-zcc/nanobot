@@ -8,7 +8,7 @@ import re
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -339,6 +339,15 @@ class FeishuConfig(Base):
             "Intermediate heartbeats still update in place; 0 disables fresh notices."
         ),
     )
+    group_context_messages: int = Field(
+        default=20,
+        ge=0,
+        le=200,
+        description=(
+            "How many recent un-addressed group messages to keep per chat and hand "
+            "to the agent when it is next mentioned. 0 disables the buffer."
+        ),
+    )
 
 
 _STREAM_ELEMENT_ID = "streaming_md"
@@ -419,6 +428,20 @@ class FeishuChannel(BaseChannel):
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._processed_card_actions: OrderedDict[str, None] = OrderedDict()
         self._reply_targets: OrderedDict[str, str] = OrderedDict()
+        # Card-click session routing.  A card.action.trigger callback only
+        # reports ``open_chat_id`` (always ``oc_…``), but p2p sessions are keyed
+        # by the user's ``ou_…`` open_id.  Without these maps a click on a card
+        # sent in a private chat lands in a different agent session than the one
+        # that produced the card.  Keyed by bot message_id and by open_chat_id.
+        self._outbound_routes: OrderedDict[str, str] = OrderedDict()
+        self._chat_routes: OrderedDict[str, str] = OrderedDict()
+        # Inbound message ids whose reply already carried an @mention, so a turn
+        # that spans several outbound messages only notifies the sender once.
+        self._mentioned_turns: OrderedDict[str, None] = OrderedDict()
+        # Recent group messages that did not address the bot, per chat.  They are
+        # not answered, but the next mention hands them over as context — people
+        # routinely post the question first and @ the bot in a follow-up message.
+        self._group_context: dict[str, deque[tuple[str, int, str]]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
         self._tool_progress_messages: dict[str, str] = {}
@@ -432,6 +455,13 @@ class FeishuChannel(BaseChannel):
         self._stale_threshold_ms: int = int(
             float(os.environ.get("NANOBOT_FEISHU_STALE_SECONDS", "120")) * 1000
         )
+
+    @staticmethod
+    def _remember(cache: OrderedDict[str, Any], key: str, value: Any, limit: int = 1000) -> None:
+        """Insert into a bounded FIFO cache, evicting the oldest entries."""
+        cache[key] = value
+        while len(cache) > limit:
+            cache.popitem(last=False)
 
     @staticmethod
     def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
@@ -568,6 +598,68 @@ class FeishuChannel(BaseChannel):
         if self.config.group_policy == "open":
             return True
         return self._is_bot_mentioned(message)
+
+    def _buffer_group_context(self, message: Any, sender_id: str) -> None:
+        """Remember an un-addressed group message as context for the next mention.
+
+        Only a compact text rendering is kept — no media is downloaded and no
+        reaction is added, because the bot is not answering this message.
+        """
+        limit = self.config.group_context_messages
+        if limit <= 0:
+            return
+        chat_id = getattr(message, "chat_id", None)
+        if not chat_id:
+            return
+
+        msg_type = getattr(message, "message_type", "")
+        try:
+            content_json = json.loads(message.content) if message.content else {}
+        except (json.JSONDecodeError, TypeError):
+            content_json = {}
+
+        if msg_type == "text":
+            text, _ = _resolve_text_mentions(
+                content_json.get("text", ""), getattr(message, "mentions", None)
+            )
+        elif msg_type == "post":
+            text, _ = _extract_post_content(content_json)
+        elif msg_type in ("share_chat", "share_user", "interactive"):
+            text = _extract_share_card_content(content_json, msg_type)
+        else:
+            text = MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
+
+        text = " ".join((text or "").split())
+        if not text:
+            return
+        if len(text) > 500:
+            text = text[:500] + "…"
+
+        buf = self._group_context.get(chat_id)
+        if buf is None or buf.maxlen != limit:
+            buf = deque(buf or (), maxlen=limit)
+            self._group_context[chat_id] = buf
+        created_ms = int(getattr(message, "create_time", 0) or 0)
+        buf.append((sender_id, created_ms, text))
+
+    def _drain_group_context(self, chat_id: str, current_sender: str) -> str:
+        """Render and clear the buffered group messages for *chat_id*."""
+        buf = self._group_context.pop(chat_id, None)
+        if not buf:
+            return ""
+        lines = []
+        for sender_id, created_ms, text in buf:
+            who = "same sender" if sender_id == current_sender else sender_id
+            when = (
+                time.strftime("%H:%M", time.localtime(created_ms / 1000))
+                if created_ms else "?"
+            )
+            lines.append(f"[{when}] ({who}) {text}")
+        return (
+            "[Recent group messages that did not address this bot — context only, "
+            "already seen by everyone in the chat]\n"
+            + "\n".join(lines)
+        )
 
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
         """Sync helper for adding reaction (runs in thread pool)."""
@@ -803,7 +895,12 @@ class FeishuChannel(BaseChannel):
         return "post"
 
     def _outbound_mention_target(self, metadata: dict[str, Any] | None) -> str | None:
-        """Return the real Feishu open_id to mention for a group reply."""
+        """Return the real Feishu open_id to mention for a group reply.
+
+        Only the *first* outbound message of a turn mentions the sender.  A turn
+        often spans several messages (media, chunked cards, follow-up sends), and
+        repeating the ``<at>`` re-notifies the group for what is one reply.
+        """
         meta = metadata or {}
         if meta.get("_progress") or meta.get("_tool_hint"):
             return None
@@ -815,7 +912,15 @@ class FeishuChannel(BaseChannel):
             target = str(meta.get("sender_open_id") or "")
         if not target and meta.get("message_id"):
             target = self._reply_targets.get(str(meta["message_id"]), "")
-        return target if re.fullmatch(r"ou_[A-Za-z0-9_-]+", target) else None
+        if not re.fullmatch(r"ou_[A-Za-z0-9_-]+", target):
+            return None
+
+        turn_key = str(meta.get("message_id") or "")
+        if turn_key:
+            if turn_key in self._mentioned_turns:
+                return None
+            self._remember(self._mentioned_turns, turn_key, None)
+        return target
 
     @classmethod
     def _markdown_to_post(
@@ -1037,7 +1142,24 @@ class FeishuChannel(BaseChannel):
 
         return None, f"[{msg_type}: download failed]"
 
-    _REPLY_CONTEXT_MAX_LEN = 200
+    _REPLY_CONTEXT_MAX_LEN = 10_000
+
+    def _get_chat_mode_sync(self, chat_id: str) -> str | None:
+        """Fetch a chat's mode ("p2p" or "group"), or None when unavailable."""
+        from lark_oapi.api.im.v1 import GetChatRequest
+        try:
+            request = GetChatRequest.builder().chat_id(chat_id).build()
+            response = self._client.im.v1.chat.get(request)
+            if not response.success():
+                logger.debug(
+                    "Feishu: could not fetch chat {}: code={}, msg={}",
+                    chat_id, response.code, response.msg,
+                )
+                return None
+            return getattr(response.data, "chat_mode", None)
+        except Exception as e:
+            logger.debug("Feishu: error fetching chat {}: {}", chat_id, e)
+            return None
 
     def _get_message_content_sync(self, message_id: str) -> str | None:
         """Fetch the text content of a Feishu message by ID (synchronous).
@@ -1480,13 +1602,17 @@ class FeishuChannel(BaseChannel):
             def _do_send(m_type: str, content: str) -> None:
                 """Send via reply (first message) or create (subsequent)."""
                 nonlocal first_send
+                sent_id: str | None = None
                 if reply_message_id and first_send:
                     first_send = False
-                    ok = self._reply_message_sync(reply_message_id, m_type, content)
-                    if ok:
-                        return
-                    # Fall back to regular send if reply fails
-                self._send_message_sync(receive_id_type, msg.chat_id, m_type, content)
+                    sent_id = self._reply_message_with_id_sync(reply_message_id, m_type, content)
+                if not sent_id:
+                    # Regular send, also the fallback when the reply failed.
+                    sent_id = self._send_message_sync(receive_id_type, msg.chat_id, m_type, content)
+                if sent_id:
+                    # A click on this message reports only its message_id, so
+                    # remember which session sent it (see _on_card_action).
+                    self._remember(self._outbound_routes, sent_id, msg.chat_id)
 
             for file_path in msg.media:
                 if not os.path.isfile(file_path):
@@ -1634,6 +1760,42 @@ class FeishuChannel(BaseChannel):
         future.add_done_callback(_log_result)
         return self._card_action_response("操作已收到，正在处理", "success")
 
+    async def _resolve_card_action_chat_id(
+        self, sender_id: str, open_chat_id: str, message_id: str
+    ) -> str:
+        """Map a card click back to the session that produced the card.
+
+        Card callbacks only carry ``open_chat_id``, which is an ``oc_…`` id even
+        for private chats, while p2p sessions are keyed by the user's ``ou_…``
+        open_id (see ``_on_message``).  Using ``open_chat_id`` verbatim would
+        split the clicker off into a second session, so resolve it against what
+        we already know about this chat, and only ask Feishu as a last resort.
+        """
+        if message_id:
+            route = self._outbound_routes.get(message_id)
+            if route:
+                return route
+        if not open_chat_id:
+            return sender_id
+        route = self._chat_routes.get(open_chat_id)
+        if route:
+            return route
+        if self._client:
+            loop = asyncio.get_running_loop()
+            chat_mode = await loop.run_in_executor(
+                None, self._get_chat_mode_sync, open_chat_id
+            )
+            if chat_mode:
+                route = sender_id if chat_mode == "p2p" else open_chat_id
+                self._remember(self._chat_routes, open_chat_id, route)
+                return route
+        logger.warning(
+            "Feishu: could not resolve session for card click in {}; "
+            "falling back to the chat id",
+            open_chat_id,
+        )
+        return open_chat_id
+
     async def _on_card_action(self, data: Any) -> None:
         """Convert a Feishu card interaction into an inbound agent instruction."""
         event = data.event
@@ -1642,11 +1804,11 @@ class FeishuChannel(BaseChannel):
         action = getattr(event, "action", None)
 
         sender_id = str(getattr(operator, "open_id", None) or "unknown")
-        chat_id = str(
-            getattr(context, "open_chat_id", None)
-            or sender_id
-        )
+        open_chat_id = str(getattr(context, "open_chat_id", None) or "")
         message_id = str(getattr(context, "open_message_id", None) or "")
+        chat_id = await self._resolve_card_action_chat_id(
+            sender_id, open_chat_id, message_id
+        )
         value = getattr(action, "value", None) or {}
         form_value = getattr(action, "form_value", None) or {}
 
@@ -1671,9 +1833,13 @@ class FeishuChannel(BaseChannel):
             "Handle the selected action as the user's current instruction.\n"
             f"Action payload: {details_json}"
         )
+        # A card click routed to the chat id itself is a group session; a p2p
+        # session routes to the clicker's open_id.
+        chat_type = "group" if chat_id == open_chat_id else "p2p"
         logger.info(
-            "Feishu card action from {} in {}: {}",
+            "Feishu card action from {} in {} (session {}): {}",
             sender_id,
+            open_chat_id or chat_id,
             chat_id,
             details_json[:500],
         )
@@ -1683,7 +1849,9 @@ class FeishuChannel(BaseChannel):
             content=content,
             metadata={
                 "message_id": message_id or None,
+                "chat_type": chat_type,
                 "msg_type": "card_action",
+                "sender_open_id": sender_id,
                 "card_action": details,
                 "card_action_token": getattr(event, "token", None),
             },
@@ -1742,7 +1910,10 @@ class FeishuChannel(BaseChannel):
                     logger.debug("Feishu: skipping non-directed bot message")
                     return
             elif chat_type == "group" and not self._is_group_message_for_bot(message):
-                logger.debug("Feishu: skipping group message (not mentioned)")
+                # Not answered, but kept: people often post the question and then
+                # @ the bot in a separate message, which on its own says nothing.
+                self._buffer_group_context(message, sender_id)
+                logger.debug("Feishu: buffering group message (not mentioned)")
                 return
 
             # Add reaction
@@ -1825,12 +1996,20 @@ class FeishuChannel(BaseChannel):
                     + content
                 )
 
+            # Hand over anything said in this group since the bot was last
+            # addressed, so a bare "@bot" still carries what it refers to.
+            if chat_type == "group":
+                if group_context := self._drain_group_context(chat_id, sender_id):
+                    content = f"{group_context}\n\n{content}" if content else group_context
+
             # Forward to message bus
             reply_to = chat_id if chat_type == "group" else sender_id
+            # Card clicks only report open_chat_id; remember how this chat maps
+            # to a session so the callback routes back to the same session.
+            if chat_id:
+                self._remember(self._chat_routes, chat_id, reply_to)
             if chat_type == "group" and sender_type != "bot" and sender_id.startswith("ou_"):
-                self._reply_targets[message_id] = sender_id
-                while len(self._reply_targets) > 1000:
-                    self._reply_targets.popitem(last=False)
+                self._remember(self._reply_targets, message_id, sender_id)
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
