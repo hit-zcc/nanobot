@@ -745,11 +745,14 @@ class AgentLoop:
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=0)
-            current_role = "assistant" if msg.sender_id == "subagent" else "user"
+            # Background results enter as a user turn, not an assistant one.
+            # They are an observation handed to the agent, and the content is
+            # already framed as "[Subagent '<label>' completed]", so the role
+            # carries no extra meaning — while an assistant-role tail makes the
+            # request a prefill that providers such as Claude reject with 400.
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
-                current_role=current_role,
             )
             live_msgs: list[dict] = []
             cursor = [1 + len(history)]

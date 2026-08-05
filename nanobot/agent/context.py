@@ -131,7 +131,6 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
-        current_role: str = "user",
         runtime_metadata: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
@@ -147,10 +146,13 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
+        # Always user-role: a request must end with a user turn. Ending on an
+        # assistant message is "prefill", which several providers reject
+        # outright (Claude: "does not support assistant message prefill").
         return [
             {"role": "system", "content": self.build_system_prompt(skill_names)},
             *history,
-            {"role": current_role, "content": merged},
+            {"role": "user", "content": merged},
         ]
 
     def build_user_message(
