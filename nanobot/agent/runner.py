@@ -50,6 +50,10 @@ class AgentRunSpec:
     iteration_warning_message: str | None = None
     concurrent_tools: bool = False
     fail_on_tool_error: bool = False
+    # Live view of the working message list. When provided, the runner fills
+    # this exact list instead of a private one, so a caller whose task gets
+    # cancelled mid-run can still persist the work completed so far.
+    message_sink: list[dict[str, Any]] | None = None
 
 
 @dataclass(slots=True)
@@ -81,7 +85,12 @@ class AgentRunner:
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
-        messages = list(spec.initial_messages)
+        if spec.message_sink is None:
+            messages = list(spec.initial_messages)
+        else:
+            messages = spec.message_sink
+            messages.clear()
+            messages.extend(spec.initial_messages)
         final_content: str | None = None
         tools_used: list[str] = []
         usage = {"prompt_tokens": 0, "completion_tokens": 0}

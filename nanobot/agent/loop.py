@@ -305,8 +305,12 @@ class AgentLoop:
         chat_id: str = "direct",
         message_id: str | None = None,
         run_state: dict[str, Any] | None = None,
+        message_sink: list[dict] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop.
+
+        *message_sink*: when given, receives the live working message list so a
+        cancelled turn can still be persisted by the caller.
 
         *on_stream*: called with each content delta during streaming.
         *on_stream_end(resuming)*: called when a streaming session finishes.
@@ -418,6 +422,7 @@ class AgentLoop:
             ),
             refusal_fallback_model=loop_self._refusal_fallback_model(),
             concurrent_tools=True,
+            message_sink=message_sink,
         ))
         await hook.finish_tool_progress()
         if run_state is not None:
@@ -653,10 +658,16 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(
-                messages, channel=channel, chat_id=chat_id,
-                message_id=msg.metadata.get("message_id"),
-            )
+            live_msgs: list[dict] = []
+            try:
+                final_content, _, all_msgs = await self._run_agent_loop(
+                    messages, channel=channel, chat_id=chat_id,
+                    message_id=msg.metadata.get("message_id"),
+                    message_sink=live_msgs,
+                )
+            except asyncio.CancelledError:
+                self._save_cancelled_turn(session, live_msgs, 1 + len(history), key)
+                raise
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
@@ -760,17 +771,23 @@ class AgentLoop:
                         streamed_final_segment = False
 
         run_state: dict[str, Any] = {}
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages,
-            on_progress=on_progress or _bus_progress,
-            on_notice=_bus_notice,
-            on_tool_progress=_bus_tool_progress if on_progress is None else None,
-            on_stream=wrapped_on_stream,
-            on_stream_end=wrapped_on_stream_end,
-            channel=msg.channel, chat_id=msg.chat_id,
-            message_id=msg.metadata.get("message_id"),
-            run_state=run_state,
-        )
+        live_msgs: list[dict] = []
+        try:
+            final_content, _, all_msgs = await self._run_agent_loop(
+                initial_messages,
+                on_progress=on_progress or _bus_progress,
+                on_notice=_bus_notice,
+                on_tool_progress=_bus_tool_progress if on_progress is None else None,
+                on_stream=wrapped_on_stream,
+                on_stream_end=wrapped_on_stream_end,
+                channel=msg.channel, chat_id=msg.chat_id,
+                message_id=msg.metadata.get("message_id"),
+                run_state=run_state,
+                message_sink=live_msgs,
+            )
+        except asyncio.CancelledError:
+            self._save_cancelled_turn(session, live_msgs, 1 + len(history), key)
+            raise
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -841,6 +858,61 @@ class AgentLoop:
             filtered.append(block)
 
         return filtered
+
+    _CANCELLED_TOOL_RESULT = (
+        "Error: tool execution was interrupted by the user (/stop). "
+        "The result is unknown — re-run it if you still need the output."
+    )
+
+    @staticmethod
+    def _seal_dangling_tool_calls(messages: list[dict]) -> list[dict]:
+        """Append synthetic results for tool calls left unanswered by a cancel.
+
+        A turn cancelled mid-tool leaves an assistant message whose
+        ``tool_calls`` have no matching ``tool`` results.  Persisting that as-is
+        makes the next request illegal for most providers, so every orphan call
+        gets an explicit "interrupted" result instead of dropping the message
+        (which would hide from the model that work was already attempted).
+        """
+        answered = {
+            str(m.get("tool_call_id"))
+            for m in messages
+            if m.get("role") == "tool" and m.get("tool_call_id")
+        }
+        sealed = list(messages)
+        for m in messages:
+            if m.get("role") != "assistant":
+                continue
+            for tc in m.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                tid = str(tc.get("id") or "")
+                if not tid or tid in answered:
+                    continue
+                answered.add(tid)
+                sealed.append({
+                    "role": "tool",
+                    "tool_call_id": tid,
+                    "name": (tc.get("function") or {}).get("name", ""),
+                    "content": AgentLoop._CANCELLED_TOOL_RESULT,
+                })
+        return sealed
+
+    def _save_cancelled_turn(
+        self, session: Session, messages: list[dict], skip: int, key: str,
+    ) -> None:
+        """Persist the work completed before a /stop so context is not lost."""
+        try:
+            if len(messages) <= skip:
+                return
+            self._save_turn(session, self._seal_dangling_tool_calls(messages), skip)
+            self.sessions.save(session)
+            logger.info(
+                "Session saved after cancellation for {} ({} new messages)",
+                key, len(messages) - skip,
+            )
+        except Exception:
+            logger.exception("Failed to save session after cancellation for {}", key)
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save new-turn messages into session, truncating large tool results."""
