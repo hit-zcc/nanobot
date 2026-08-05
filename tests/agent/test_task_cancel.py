@@ -288,9 +288,10 @@ class TestSubagentCancellation:
         await asyncio.gather(*mgr._running_tasks.values())
 
     @pytest.mark.asyncio
-    async def test_subagent_publishes_updatable_progress_heartbeat(
+    async def test_subagent_runs_silently_but_tracks_state_for_pull(
         self, monkeypatch, tmp_path,
     ):
+        """A running subagent must not push anything: status is pull-only."""
         from nanobot.agent.subagent import SubagentManager
         from nanobot.bus.queue import MessageBus
         from nanobot.providers.base import LLMResponse, ToolCallRequest
@@ -310,8 +311,17 @@ class TestSubagentCancellation:
             LLMResponse(content="done", tool_calls=[]),
         ])
         mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
-        monkeypatch.setattr(mgr, "_PROGRESS_FIRST_SECONDS", 0.01)
-        monkeypatch.setattr(mgr, "_PROGRESS_INTERVAL_SECONDS", 0.01)
+
+        seen_states = []
+
+        original_update = mgr._update_state
+
+        def spy(task_id, **changes):
+            original_update(task_id, **changes)
+            state = mgr._task_states[task_id]
+            seen_states.append((state.phase, list(state.current_tools)))
+
+        monkeypatch.setattr(mgr, "_update_state", spy)
 
         async def slow_execute(self, name, arguments):
             await asyncio.sleep(0.035)
@@ -330,17 +340,12 @@ class TestSubagentCancellation:
             session_key="feishu.jarvis:u1",
         )
 
-        progress = []
-        while not bus.outbound.empty():
-            progress.append(bus.outbound.get_nowait())
+        # Nothing was pushed to the channel -- the only outbound side effect of a
+        # normal task is the final announcement, which goes on the inbound bus.
+        assert bus.outbound.empty()
 
-        assert any(
-            "运行 Maven 编译/测试" in item.content
-            and item.metadata["_tool_progress_done"] is False
-            for item in progress
-        )
-        assert progress[-1].metadata["_tool_progress_done"] is True
-        assert progress[-1].metadata["_tool_progress_id"] == "subagent-progress:sub-1"
+        # ...but the state was tracked all along, so "怎么样了" can be answered.
+        assert ("正在执行工具", ["运行 Maven 编译/测试"]) in seen_states
         assert mgr._task_states["sub-1"].status == "completed"
 
     @pytest.mark.asyncio
