@@ -57,6 +57,16 @@ class AgentHook:
         """
         pass
 
+    async def take_injections(self, context: AgentHookContext) -> list[dict[str, Any]]:
+        """Return user messages to splice into the run at an iteration boundary.
+
+        Lets a user interrupt a long run: anything they send while tools are
+        executing is handed to the model on the next iteration instead of
+        waiting for the whole turn to finish. Returning an empty list (the
+        default) keeps the run untouched.
+        """
+        return []
+
     async def after_iteration(self, context: AgentHookContext) -> None:
         pass
 

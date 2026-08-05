@@ -153,6 +153,10 @@ class AgentLoop:
         )
         self._inbound_buffer: dict[str, list[InboundMessage]] = {}
         self._debounce_tasks: dict[str, asyncio.Task] = {}
+        # Messages that arrived while a turn was already running. They are
+        # spliced into that run at its next tool boundary rather than queued
+        # behind it, so the user can steer or interrupt long jobs.
+        self._pending_injections: dict[str, list[InboundMessage]] = {}
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
@@ -306,11 +310,14 @@ class AgentLoop:
         message_id: str | None = None,
         run_state: dict[str, Any] | None = None,
         message_sink: list[dict] | None = None,
+        injection_key: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop.
 
         *message_sink*: when given, receives the live working message list so a
         cancelled turn can still be persisted by the caller.
+        *injection_key*: session key whose queued interjections are spliced in
+        at tool boundaries, letting the user steer a run already in flight.
 
         *on_stream*: called with each content delta during streaming.
         *on_stream_end(resuming)*: called when a streaming session finishes.
@@ -362,6 +369,24 @@ class AgentLoop:
                     await on_notice(message)
                 elif on_progress:
                     await on_progress(message)
+
+            async def take_injections(self, context: AgentHookContext) -> list[dict[str, Any]]:
+                if not injection_key:
+                    return []
+                pending = loop_self._take_injections(injection_key)
+                if not pending:
+                    return []
+                built = loop_self._build_injection_messages(pending)
+                if not built:
+                    return []
+                logger.info(
+                    "Injecting {} interjection(s) into running turn for {}",
+                    len(pending), injection_key,
+                )
+                await self.on_notice(
+                    context, "📨 收到你的新消息，已插进当前任务，我马上把它一起考虑。",
+                )
+                return built
 
             async def on_tool_heartbeat(
                 self, context: AgentHookContext, *, elapsed: float, pending: list[str],
@@ -467,7 +492,12 @@ class AgentLoop:
             # System notifications are independent turns.  They may target the
             # same session as a user message, but must queue behind it rather
             # than being merged into the user's text burst.
-            if self._coalesce_window > 0 and msg.channel != "system":
+            # A message that lands while its session is mid-turn interrupts
+            # that turn instead of queueing behind it. System notifications are
+            # excluded: they are independent turns, not user steering.
+            if msg.channel != "system" and self._has_active_run(msg):
+                self._queue_injection(msg)
+            elif self._coalesce_window > 0 and msg.channel != "system":
                 self._buffer_inbound(msg)
             else:
                 self._spawn_dispatch(msg)
@@ -488,7 +518,40 @@ class AgentLoop:
         task = asyncio.create_task(self._dispatch(msg))
         key = self._dispatch_session_key(msg)
         self._active_tasks.setdefault(key, []).append(task)
-        task.add_done_callback(lambda t, k=key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+        task.add_done_callback(lambda t, k=key: self._on_dispatch_done(k, t))
+
+    def _on_dispatch_done(self, key: str, task: asyncio.Task) -> None:
+        """Untrack a finished dispatch and rescue any last-moment interjection.
+
+        A message can be queued as an interjection in the window between the
+        run's final boundary check and this callback, when the task is still
+        listed as active. Nobody would ever consume it, so once the session is
+        truly idle, replay whatever is left.
+        """
+        tasks = self._active_tasks.get(key, [])
+        if task in tasks:
+            tasks.remove(task)
+        if not tasks:
+            self._active_tasks.pop(key, None)
+        if task.cancelled():
+            self._take_injections(key)  # /stop must not restart work
+        elif not any(not t.done() for t in self._active_tasks.get(key, [])):
+            self._replay_unconsumed_injections(key)
+
+    def _has_active_run(self, msg: InboundMessage) -> bool:
+        """True if a turn for this session is currently executing."""
+        key = self._dispatch_session_key(msg)
+        return any(not t.done() for t in self._active_tasks.get(key, []))
+
+    def _queue_injection(self, msg: InboundMessage) -> None:
+        """Hold a message for the running turn to pick up at its next boundary."""
+        key = self._dispatch_session_key(msg)
+        self._pending_injections.setdefault(key, []).append(msg)
+        logger.info("Queued interjection for running turn in session {}", key)
+
+    def _take_injections(self, key: str) -> list[InboundMessage]:
+        """Remove and return the messages queued for *key*."""
+        return self._pending_injections.pop(key, [])
 
     def _buffer_inbound(self, msg: InboundMessage) -> None:
         """Buffer a message and (re)start the per-session coalesce timer.
@@ -605,6 +668,23 @@ class AgentLoop:
                     channel=msg.channel, chat_id=msg.chat_id,
                     content="Sorry, I encountered an error.",
                 ))
+
+    def _replay_unconsumed_injections(self, key: str) -> None:
+        """Dispatch interjections the finished turn never picked up.
+
+        A turn that ended without hitting a tool boundary (or ended right after
+        one) leaves them unconsumed; they become their own turn rather than
+        being dropped.
+        """
+        pending = self._take_injections(key)
+        if not pending:
+            return
+        logger.info(
+            "Replaying {} unconsumed interjection(s) as a new turn for {}",
+            len(pending), key,
+        )
+        merged = pending[0] if len(pending) == 1 else self._merge_inbound(pending)
+        self._spawn_dispatch(merged)
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
@@ -784,9 +864,18 @@ class AgentLoop:
                 message_id=msg.metadata.get("message_id"),
                 run_state=run_state,
                 message_sink=live_msgs,
+                injection_key=self._dispatch_session_key(msg),
             )
         except asyncio.CancelledError:
-            self._save_cancelled_turn(session, live_msgs, 1 + len(history), key)
+            # A stopped run must not silently swallow whatever the user sent
+            # while it ran: persist those interjections instead of replaying
+            # them, so /stop really stops rather than restarting work.
+            orphaned = self._build_injection_messages(
+                self._take_injections(self._dispatch_session_key(msg))
+            )
+            self._save_cancelled_turn(
+                session, live_msgs, 1 + len(history), key, extra=orphaned,
+            )
             raise
 
         if final_content is None:
@@ -859,6 +948,26 @@ class AgentLoop:
 
         return filtered
 
+    _INTERJECTION_PREFIX = (
+        "[用户在你执行任务的过程中发来了新消息。请先读懂它：如果是纠正或改变方向，"
+        "立即调整后续步骤；如果只是补充信息，就并入当前任务继续。不要重新开始已完成的工作。]"
+    )
+
+    def _build_injection_messages(
+        self, pending: list[InboundMessage],
+    ) -> list[dict[str, Any]]:
+        """Turn queued interjections into a single user message for the run."""
+        texts = [m.content.strip() for m in pending if m.content and m.content.strip()]
+        media: list[str] = []
+        for m in pending:
+            media.extend(m.media)
+        if not texts and not media:
+            return []
+        body = "\n".join(texts) if texts else "（用户发来了附件）"
+        return [self.context.build_user_message(
+            f"{self._INTERJECTION_PREFIX}\n{body}", media or None,
+        )]
+
     _CANCELLED_TOOL_RESULT = (
         "Error: tool execution was interrupted by the user (/stop). "
         "The result is unknown — re-run it if you still need the output."
@@ -900,12 +1009,20 @@ class AgentLoop:
 
     def _save_cancelled_turn(
         self, session: Session, messages: list[dict], skip: int, key: str,
+        extra: list[dict] | None = None,
     ) -> None:
-        """Persist the work completed before a /stop so context is not lost."""
+        """Persist the work completed before a /stop so context is not lost.
+
+        *extra* is appended after tool results are sealed, so interjections that
+        never got consumed still reach the history in a legal position.
+        """
         try:
-            if len(messages) <= skip:
+            if len(messages) <= skip and not extra:
                 return
-            self._save_turn(session, self._seal_dangling_tool_calls(messages), skip)
+            sealed = self._seal_dangling_tool_calls(messages)
+            if extra:
+                sealed = sealed + extra
+            self._save_turn(session, sealed, skip)
             self.sessions.save(session)
             logger.info(
                 "Session saved after cancellation for {} ({} new messages)",

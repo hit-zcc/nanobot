@@ -252,6 +252,14 @@ class AgentRunner:
                         "name": tool_call.name,
                         "content": result,
                     })
+
+                # Interjection point: tool results are settled and the message
+                # list is in a legal state, so anything the user sent while the
+                # tools ran can be spliced in here and reach the model on the
+                # very next call instead of waiting out the whole turn.
+                if injections := await hook.take_injections(context):
+                    messages.extend(injections)
+
                 await hook.after_iteration(context)
                 continue
 

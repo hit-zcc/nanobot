@@ -153,6 +153,16 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             {"role": current_role, "content": merged},
         ]
 
+    def build_user_message(
+        self, text: str, media: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Build a standalone user message (no system prompt, no runtime header).
+
+        Used for mid-run interjections, where the turn's system prompt and
+        runtime context are already present earlier in the message list.
+        """
+        return {"role": "user", "content": self._build_user_content(text, media)}
+
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""
         if not media:
