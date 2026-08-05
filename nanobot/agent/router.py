@@ -7,8 +7,6 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from nanobot.command import CommandContext, command_text
-
 if TYPE_CHECKING:
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.events import InboundMessage
@@ -48,24 +46,10 @@ class AgentRouter:
         return self.agents[self.default_agent_id]
 
     async def _accept(self, agent: AgentLoop, msg: InboundMessage) -> None:
-        raw = command_text(msg.content, msg.metadata)
-        if agent.commands.is_priority(raw):
-            ctx = CommandContext(
-                msg=msg,
-                session=None,
-                key=msg.session_key,
-                raw=raw,
-                loop=agent,
-            )
-            result = await agent.commands.dispatch_priority(ctx)
-            if result:
-                await self.bus.publish_outbound(result)
-            return
-
-        if agent._coalesce_window > 0 and msg.channel != "system":
-            agent._buffer_inbound(msg)
-        else:
-            agent._spawn_dispatch(msg)
+        # Delegate rather than re-implement: admission rules (priority commands,
+        # mid-turn interjections, burst coalescing) must not drift between the
+        # single-agent loop and this router.
+        await agent.accept_inbound(msg)
 
     async def run(self) -> None:
         """Connect all agents and route messages until stopped."""

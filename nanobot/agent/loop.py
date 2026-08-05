@@ -489,25 +489,31 @@ class AgentLoop:
                 logger.warning("Error consuming inbound message: {}, continuing...", e)
                 continue
 
-            raw = command_text(msg.content, msg.metadata)
-            if self.commands.is_priority(raw):
-                ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
-                result = await self.commands.dispatch_priority(ctx)
-                if result:
-                    await self.bus.publish_outbound(result)
-                continue
-            # System notifications are independent turns.  They may target the
-            # same session as a user message, but must queue behind it rather
-            # than being merged into the user's text burst.
-            # A message that lands while its session is mid-turn interrupts
-            # that turn instead of queueing behind it. System notifications are
-            # excluded: they are independent turns, not user steering.
-            if msg.channel != "system" and self._has_active_run(msg):
-                self._queue_injection(msg)
-            elif self._coalesce_window > 0 and msg.channel != "system":
-                self._buffer_inbound(msg)
-            else:
-                self._spawn_dispatch(msg)
+            await self.accept_inbound(msg)
+
+    async def accept_inbound(self, msg: InboundMessage) -> None:
+        """Route one inbound message to the right entry path.
+
+        Single source of truth for admission, shared by this loop and by
+        AgentRouter in multi-agent mode. Duplicating it once already meant the
+        router silently missed interjection support.
+        """
+        raw = command_text(msg.content, msg.metadata)
+        if self.commands.is_priority(raw):
+            ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
+            if result := await self.commands.dispatch_priority(ctx):
+                await self.bus.publish_outbound(result)
+            return
+
+        # A message landing mid-turn steers that turn instead of queueing behind
+        # it. System notifications are excluded: they are independent turns, and
+        # must neither interrupt the user's turn nor merge into their text burst.
+        if msg.channel != "system" and self._has_active_run(msg):
+            self._queue_injection(msg)
+        elif self._coalesce_window > 0 and msg.channel != "system":
+            self._buffer_inbound(msg)
+        else:
+            self._spawn_dispatch(msg)
 
     @staticmethod
     def _dispatch_session_key(msg: InboundMessage) -> str:

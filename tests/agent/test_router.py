@@ -1,5 +1,6 @@
 import pytest
 
+from nanobot.agent.loop import AgentLoop
 from nanobot.agent.router import AgentRouter
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
@@ -13,9 +14,24 @@ class FakeCommands:
 
 
 class FakeAgent:
+    """Stand-in agent that reuses the real admission logic.
+
+    ``accept_inbound`` is bound from AgentLoop on purpose: the router must not
+    carry its own copy of the routing rules, and a fake that reimplements them
+    would hide exactly that kind of drift.
+    """
+
+    accept_inbound = AgentLoop.accept_inbound
+    _has_active_run = AgentLoop._has_active_run
+    _queue_injection = AgentLoop._queue_injection
+    _dispatch_session_key = staticmethod(AgentLoop._dispatch_session_key)
+
     def __init__(self) -> None:
         self.commands = FakeCommands()
+        self.bus = MessageBus()
         self._coalesce_window = 3.0
+        self._active_tasks: dict[str, list] = {}
+        self._pending_injections: dict[str, list[InboundMessage]] = {}
         self.buffered: list[InboundMessage] = []
         self.spawned: list[InboundMessage] = []
 
@@ -75,6 +91,52 @@ async def test_accept_preserves_agent_coalescing_and_system_dispatch() -> None:
     await router._accept(agent, system_msg)
 
     assert agent.buffered == [user_msg]
+    assert agent.spawned == [system_msg]
+
+
+@pytest.mark.asyncio
+async def test_accept_routes_interjection_in_multi_agent_mode() -> None:
+    """Regression: the router used to lack interjection support entirely.
+
+    Multi-agent deployments go through AgentRouter, not AgentLoop.run(), so a
+    message sent mid-turn was buffered and then blocked on the session lock —
+    the exact queue-behind behaviour interjections are meant to replace.
+    """
+    class _Running:
+        def done(self) -> bool:
+            return False
+
+    agent = FakeAgent()
+    agent._active_tasks["feishu:c1"] = [_Running()]
+    router = AgentRouter(MessageBus(), {"jarvis": agent}, [], "jarvis")
+
+    mid_turn = InboundMessage(
+        channel="feishu", sender_id="u1", chat_id="c1", content="wait, wrong file",
+    )
+    await router._accept(agent, mid_turn)
+
+    assert agent._pending_injections["feishu:c1"] == [mid_turn]
+    assert agent.buffered == [], "interjection was buffered instead of injected"
+    assert agent.spawned == []
+
+
+@pytest.mark.asyncio
+async def test_accept_keeps_system_messages_out_of_interjections() -> None:
+    """Background reports are independent turns, not user steering."""
+    class _Running:
+        def done(self) -> bool:
+            return False
+
+    agent = FakeAgent()
+    agent._active_tasks["feishu:c1"] = [_Running()]
+    router = AgentRouter(MessageBus(), {"jarvis": agent}, [], "jarvis")
+
+    system_msg = InboundMessage(
+        channel="system", sender_id="system", chat_id="feishu:c1", content="done",
+    )
+    await router._accept(agent, system_msg)
+
+    assert agent._pending_injections.get("feishu:c1") in (None, [])
     assert agent.spawned == [system_msg]
 
 
