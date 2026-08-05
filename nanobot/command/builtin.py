@@ -6,6 +6,8 @@ import asyncio
 import os
 import sys
 
+from loguru import logger
+
 from nanobot import __version__
 from nanobot.bus.events import OutboundMessage
 from nanobot.command.router import CommandContext, CommandRouter
@@ -29,12 +31,28 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
 
 
+def _flush_sessions(ctx: CommandContext) -> None:
+    """Best-effort persist of cached sessions before the process is replaced."""
+    try:
+        sessions = getattr(ctx.loop, "sessions", None)
+        for session in list(getattr(sessions, "_cache", {}).values()):
+            try:
+                sessions.save(session)
+            except Exception:
+                logger.exception("Failed to flush session {} before restart", session.key)
+    except Exception:
+        logger.exception("Session flush before restart failed")
+
+
 async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
     """Restart the process in-place via os.execv."""
     msg = ctx.msg
 
     async def _do_restart():
         await asyncio.sleep(1)
+        # execv replaces the process image, so no atexit/finally handler ever
+        # runs: anything still only in memory is gone. Flush first.
+        _flush_sessions(ctx)
         os.execv(sys.executable, [sys.executable, "-m", "nanobot"] + sys.argv[1:])
 
     asyncio.create_task(_do_restart())

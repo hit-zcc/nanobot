@@ -311,6 +311,7 @@ class AgentLoop:
         run_state: dict[str, Any] | None = None,
         message_sink: list[dict] | None = None,
         injection_key: str | None = None,
+        on_checkpoint: Callable[[list[dict]], None] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop.
 
@@ -318,6 +319,8 @@ class AgentLoop:
         cancelled turn can still be persisted by the caller.
         *injection_key*: session key whose queued interjections are spliced in
         at tool boundaries, letting the user steer a run already in flight.
+        *on_checkpoint*: called at each iteration boundary with the live message
+        list so the caller can persist progress before the turn completes.
 
         *on_stream*: called with each content delta during streaming.
         *on_stream_end(resuming)*: called when a streaming session finishes.
@@ -418,6 +421,10 @@ class AgentLoop:
                 await on_tool_progress(
                     content, progress_id=self._tool_progress_id, done=True,
                 )
+
+            async def after_iteration(self, context: AgentHookContext) -> None:
+                if on_checkpoint:
+                    on_checkpoint(context.messages)
 
             def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
                 return loop_self._strip_think(content)
@@ -739,16 +746,22 @@ class AgentLoop:
                 current_role=current_role,
             )
             live_msgs: list[dict] = []
+            cursor = [1 + len(history)]
+
+            def _checkpoint(msgs: list[dict]) -> None:
+                cursor[0] = self._checkpoint_turn(session, msgs, cursor[0], key)
+
             try:
                 final_content, _, all_msgs = await self._run_agent_loop(
                     messages, channel=channel, chat_id=chat_id,
                     message_id=msg.metadata.get("message_id"),
                     message_sink=live_msgs,
+                    on_checkpoint=_checkpoint,
                 )
             except asyncio.CancelledError:
-                self._save_cancelled_turn(session, live_msgs, 1 + len(history), key)
+                self._save_cancelled_turn(session, live_msgs, cursor[0], key)
                 raise
-            self._save_turn(session, all_msgs, 1 + len(history))
+            self._save_turn(session, all_msgs, cursor[0])
             self.sessions.save(session)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
             return OutboundMessage(channel=channel, chat_id=chat_id,
@@ -852,6 +865,11 @@ class AgentLoop:
 
         run_state: dict[str, Any] = {}
         live_msgs: list[dict] = []
+        cursor = [1 + len(history)]
+
+        def _checkpoint(msgs: list[dict]) -> None:
+            cursor[0] = self._checkpoint_turn(session, msgs, cursor[0], key)
+
         try:
             final_content, _, all_msgs = await self._run_agent_loop(
                 initial_messages,
@@ -865,6 +883,7 @@ class AgentLoop:
                 run_state=run_state,
                 message_sink=live_msgs,
                 injection_key=self._dispatch_session_key(msg),
+                on_checkpoint=_checkpoint,
             )
         except asyncio.CancelledError:
             # A stopped run must not silently swallow whatever the user sent
@@ -874,14 +893,14 @@ class AgentLoop:
                 self._take_injections(self._dispatch_session_key(msg))
             )
             self._save_cancelled_turn(
-                session, live_msgs, 1 + len(history), key, extra=orphaned,
+                session, live_msgs, cursor[0], key, extra=orphaned,
             )
             raise
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
-        self._save_turn(session, all_msgs, 1 + len(history))
+        self._save_turn(session, all_msgs, cursor[0])
         self.sessions.save(session)
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
 
@@ -1006,6 +1025,28 @@ class AgentLoop:
                     "content": AgentLoop._CANCELLED_TOOL_RESULT,
                 })
         return sealed
+
+    def _checkpoint_turn(
+        self, session: Session, messages: list[dict], cursor: int, key: str,
+    ) -> int:
+        """Persist the turn so far, mid-run. Returns the new cursor.
+
+        Saving only at the end of a turn means anything that kills the process
+        outright — ``os.execv`` on restart, SIGKILL, a crash — takes the whole
+        turn with it, including the messages describing what was just done.
+        Checkpointing at iteration boundaries bounds that loss to the current
+        step. Boundaries are also the only safe place: every tool call already
+        has its result, so the persisted history stays legal.
+        """
+        if len(messages) <= cursor:
+            return cursor
+        try:
+            self._save_turn(session, messages, cursor)
+            self.sessions.save(session)
+            return len(messages)
+        except Exception:
+            logger.exception("Mid-run checkpoint failed for {}", key)
+            return cursor
 
     def _save_cancelled_turn(
         self, session: Session, messages: list[dict], skip: int, key: str,
