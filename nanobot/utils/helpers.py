@@ -214,6 +214,16 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
         return max(4, len(payload) // 4 + 4)
 
 
+def estimate_text_tokens(text: str) -> int:
+    """Estimate prompt tokens for a raw text blob."""
+    if not text:
+        return 0
+    try:
+        return len(tiktoken.get_encoding("cl100k_base").encode(text))
+    except Exception:
+        return len(text) // 4
+
+
 def estimate_prompt_tokens_chain(
     provider: Any,
     model: str | None,

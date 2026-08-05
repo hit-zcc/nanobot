@@ -38,6 +38,10 @@ class AgentDefaults(Base):
     )
     max_tokens: int = 8192
     context_window_tokens: int = 65_536
+    # MEMORY.md is re-read into the system prompt every turn, and save_memory only
+    # ever appends, so it grows without bound and silently eats the context window.
+    # Past this many tokens the memory is compacted into a dated archive file.
+    memory_max_tokens: int = 24_000
     temperature: float = 0.1
     max_tool_iterations: int = 80
     max_subagent_tool_iterations: int = 80

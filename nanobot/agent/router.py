@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from nanobot.command import CommandContext
+from nanobot.command import CommandContext, command_text
 
 if TYPE_CHECKING:
     from nanobot.agent.loop import AgentLoop
@@ -48,7 +48,7 @@ class AgentRouter:
         return self.agents[self.default_agent_id]
 
     async def _accept(self, agent: AgentLoop, msg: InboundMessage) -> None:
-        raw = msg.content.strip()
+        raw = command_text(msg.content, msg.metadata)
         if agent.commands.is_priority(raw):
             ctx = CommandContext(
                 msg=msg,

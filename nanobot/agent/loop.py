@@ -27,7 +27,7 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
+from nanobot.command import CommandContext, CommandRouter, command_text, register_builtin_commands
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
@@ -91,6 +91,7 @@ class AgentLoop:
         max_iterations: int = 80,
         max_subagent_iterations: int = 80,
         context_window_tokens: int = 65_536,
+        memory_max_tokens: int = 24_000,
         web_search_config: WebSearchConfig | None = None,
         web_proxy: str | None = None,
         exec_config: ExecToolConfig | None = None,
@@ -110,6 +111,7 @@ class AgentLoop:
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
         self.context_window_tokens = context_window_tokens
+        self.memory_max_tokens = memory_max_tokens
         self.web_search_config = web_search_config or WebSearchConfig()
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
@@ -165,6 +167,7 @@ class AgentLoop:
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
+            memory_max_tokens=memory_max_tokens,
         )
         self._register_default_tools()
         self.commands = CommandRouter()
@@ -449,7 +452,7 @@ class AgentLoop:
                 logger.warning("Error consuming inbound message: {}, continuing...", e)
                 continue
 
-            raw = msg.content.strip()
+            raw = command_text(msg.content, msg.metadata)
             if self.commands.is_priority(raw):
                 ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
                 result = await self.commands.dispatch_priority(ctx)
@@ -667,7 +670,7 @@ class AgentLoop:
         session = self.sessions.get_or_create(key)
 
         # Slash commands
-        raw = msg.content.strip()
+        raw = command_text(msg.content, msg.metadata)
         ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
         if result := await self.commands.dispatch(ctx):
             return result

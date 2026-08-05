@@ -12,7 +12,12 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from loguru import logger
 
-from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain
+from nanobot.utils.helpers import (
+    ensure_dir,
+    estimate_message_tokens,
+    estimate_prompt_tokens_chain,
+    estimate_text_tokens,
+)
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
@@ -140,6 +145,108 @@ class MemoryStore:
     def get_memory_context(self) -> str:
         long_term = self.read_long_term()
         return f"## Long-term Memory\n{long_term}" if long_term else ""
+
+    # --- long-term memory compaction -------------------------------------------------
+    #
+    # MEMORY.md is re-read into the system prompt on *every* turn while save_memory
+    # only ever appends, so without a ceiling it grows until it owns the whole context
+    # window (it reached 64k tokens in production before this existed).  Compaction
+    # spills the fattest entries into a dated archive and leaves their headline behind
+    # as an index -- nothing is deleted, the agent can grep the archive when a headline
+    # turns out to matter.
+
+    _COMPACT_MIN_ENTRY_TOKENS = 120  # smaller entries cost less than the index line saves
+    _COMPACT_TARGET_RATIO = 0.8  # compact below the cap so it does not retrigger at once
+    _ARCHIVE_POINTER = (
+        "> 部分条目只剩标题，正文已归档到 `memory/MEMORY_archive_*.md`（按标题 grep 取回全文），\n"
+        "> 更细的过程记录在 `memory/HISTORY.md`。需要细节时去读，别凭标题猜。"
+    )
+
+    @staticmethod
+    def _split_entries(text: str) -> list[str]:
+        """Split memory into top-level bullet entries; non-bullet lines stay as-is."""
+        blocks: list[str] = []
+        current: list[str] = []
+        for line in text.split("\n"):
+            starts_entry = line.startswith("- ") or re.match(r"^#{1,6} ", line)
+            if starts_entry and current:
+                blocks.append("\n".join(current))
+                current = []
+            current.append(line)
+        if current:
+            blocks.append("\n".join(current))
+        return blocks
+
+    @staticmethod
+    def _entry_headline(entry: str) -> str:
+        """Shrink one bullet entry to an index line that still identifies it."""
+        first = entry.split("\n", 1)[0]
+        if bold := re.match(r"(- \*\*.*?\*\*)", first):
+            return bold.group(1)
+        # No bold title: cut at the first clause separator so the line stays readable.
+        for sep in ("：", ": ", "。"):
+            head, found, _ = first.partition(sep)
+            if found and len(head) > 4:
+                return head + found.rstrip(" ")
+        return first[:200]
+
+    def compact_long_term(self, max_tokens: int) -> bool:
+        """Spill the fattest MEMORY.md entries into a dated archive. Returns True if changed."""
+        if max_tokens <= 0:
+            return False
+        text = self.read_long_term()
+        total = estimate_text_tokens(text)
+        if total <= max_tokens:
+            return False
+
+        target = int(max_tokens * self._COMPACT_TARGET_RATIO)
+        entries = self._split_entries(text)
+        sizes = [estimate_text_tokens(entry) for entry in entries]
+
+        # Largest-first: fewest entries lose their body for a given saving.
+        order = sorted(
+            (i for i, size in enumerate(sizes) if size >= self._COMPACT_MIN_ENTRY_TOKENS
+             and entries[i].startswith("- ")),
+            key=lambda i: sizes[i],
+            reverse=True,
+        )
+        spilled: dict[int, str] = {}
+        running = total
+        for idx in order:
+            if running <= target:
+                break
+            headline = self._entry_headline(entries[idx])
+            saving = sizes[idx] - estimate_text_tokens(headline)
+            if saving <= 0:
+                continue
+            spilled[idx] = headline
+            running -= saving
+
+        if not spilled:
+            logger.warning(
+                "Long-term memory is {} tokens (cap {}) but has no entry big enough to "
+                "compact -- it needs manual cleanup", total, max_tokens,
+            )
+            return False
+
+        archive = self.memory_dir / f"MEMORY_archive_{datetime.now().strftime('%Y-%m-%d')}.md"
+        with open(archive, "a", encoding="utf-8") as fh:
+            if archive.stat().st_size == 0:
+                fh.write("# MEMORY 归档\n\nMEMORY.md 中被压成标题的条目全文。\n\n")
+            for idx in sorted(spilled):
+                fh.write(entries[idx].rstrip() + "\n\n")
+
+        compacted = [spilled.get(i, entry) for i, entry in enumerate(entries)]
+        updated = "\n".join(compacted)
+        if self._ARCHIVE_POINTER not in updated:
+            updated = f"{self._ARCHIVE_POINTER}\n\n{updated.lstrip()}"
+        self.write_long_term(re.sub(r"\n{3,}", "\n\n", updated))
+
+        logger.info(
+            "Long-term memory compacted: {} -> {} tokens (cap {}), {} entries archived to {}",
+            total, estimate_text_tokens(updated), max_tokens, len(spilled), archive.name,
+        )
+        return True
 
     @staticmethod
     def _format_messages(messages: list[dict]) -> str:
@@ -287,6 +394,7 @@ class MemoryConsolidator:
         build_messages: Callable[..., list[dict[str, Any]]],
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
         max_completion_tokens: int = 4096,
+        memory_max_tokens: int = 24_000,
     ):
         self.store = MemoryStore(workspace)
         self.provider = provider
@@ -294,6 +402,7 @@ class MemoryConsolidator:
         self.sessions = sessions
         self.context_window_tokens = context_window_tokens
         self.max_completion_tokens = max_completion_tokens
+        self.memory_max_tokens = memory_max_tokens
         try:
             _base_max_tokens = int(max_completion_tokens)
         except (TypeError, ValueError):
@@ -311,9 +420,16 @@ class MemoryConsolidator:
 
     async def consolidate_messages(self, messages: list[dict[str, object]]) -> bool:
         """Archive a selected message chunk into persistent memory."""
-        return await self.store.consolidate(
+        ok = await self.store.consolidate(
             messages, self.provider, self.model, max_tokens=self.consolidation_max_tokens
         )
+        # Consolidation is the only thing that grows MEMORY.md, so this is the one
+        # place the cap can be enforced without checking on every turn.
+        try:
+            self.store.compact_long_term(self.memory_max_tokens)
+        except Exception:
+            logger.exception("Long-term memory compaction failed")
+        return ok
 
     def pick_consolidation_boundary(
         self,

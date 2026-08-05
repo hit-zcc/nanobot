@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -10,6 +11,34 @@ if TYPE_CHECKING:
     from nanobot.session.manager import Session
 
 Handler = Callable[["CommandContext"], Awaitable["OutboundMessage | None"]]
+
+_LEADING_MENTION_RE = re.compile(r"^(?:@\S+\s+)+")
+
+
+def command_text(content: str | None, metadata: dict[str, Any] | None = None) -> str:
+    """Strip leading @mentions so group messages can still match commands.
+
+    Group channels keep the "@bot" text in the message body, so "@bot /stop"
+    would never match the exact "/stop" entry and would be handed to the model
+    as ordinary chat instead.  Known mention display names are peeled off first
+    because they may contain spaces; whatever is left falls back to a generic
+    "@token" match.  Only the text used for matching is normalized -- the model
+    still sees the original message.
+    """
+    text = (content or "").strip()
+    names = [
+        str(mention.get("name") or "")
+        for mention in (metadata or {}).get("mentions") or []
+        if isinstance(mention, dict)
+    ]
+    peeled = True
+    while peeled:
+        peeled = False
+        for name in names:
+            if name and text.startswith(f"@{name}"):
+                text = text[len(name) + 1:].lstrip()
+                peeled = True
+    return _LEADING_MENTION_RE.sub("", text).strip()
 
 
 @dataclass
