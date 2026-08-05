@@ -44,6 +44,8 @@ class SubagentTaskState:
     completed_tools: int = 0
     current_tools: list[str] = field(default_factory=list)
     progress_sent: bool = False
+    last_signature: str = ""
+    last_progress_at: float = 0.0
 
 
 class SubagentManager:
@@ -51,6 +53,9 @@ class SubagentManager:
 
     _PROGRESS_FIRST_SECONDS = 20.0
     _PROGRESS_INTERVAL_SECONDS = 60.0
+    # 心跳只在阶段/轮次/工具集/已完成步数有实质变化时推送; 长时间无变化也至少
+    # 每 _PROGRESS_STALE_SECONDS 推一次, 免得用户以为任务卡死了.
+    _PROGRESS_STALE_SECONDS = 300.0
     _MAX_RETAINED_STATES = 64
     _TOOL_LABELS = {
         "read_file": "读取代码",
@@ -286,7 +291,22 @@ class SubagentManager:
                     "error",
                 )
                 return
-            final_result = result.final_content or "Task completed but no final response was generated."
+            # 空最终回复 = 没有交付物, 绝不能当成功播报 (历史上出过"说完成了其实没出货").
+            final_result = (result.final_content or "").strip()
+            if not final_result:
+                logger.warning("Subagent [{}] finished with empty final content", task_id)
+                await self._finish_state(task_id, "failed")
+                await self._announce_result(
+                    task_id,
+                    label,
+                    task,
+                    "后台任务跑完了循环但没有产出任何最终回复，"
+                    "无法确认交付物是否真的生成。以下是已执行到的步骤：\n\n"
+                    + self._format_partial_progress(result),
+                    origin,
+                    "error",
+                )
+                return
 
             logger.info("Subagent [{}] completed successfully", task_id)
             await self._finish_state(task_id, "completed")
@@ -339,15 +359,37 @@ class SubagentManager:
                 state = self._task_states.get(task_id)
                 if state is None or state.status != "running":
                     return
-                await self._publish_progress(state, done=False)
+                if self._should_publish_progress(state):
+                    await self._publish_progress(state, done=False)
                 await asyncio.sleep(self._PROGRESS_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Subagent [{}] progress heartbeat failed", task_id)
 
+    @staticmethod
+    def _state_signature(state: SubagentTaskState) -> str:
+        """进度指纹: 只有这几项变了才算"有实质进展", 否则重复推送就是噪音."""
+        return "|".join([
+            state.phase,
+            str(state.iteration),
+            ",".join(state.current_tools),
+            str(state.completed_tools),
+        ])
+
+    def _should_publish_progress(self, state: SubagentTaskState) -> bool:
+        """有实质变化才推; 长时间无变化则按 stale 间隔兜底推一次(证明还活着)."""
+        signature = self._state_signature(state)
+        if signature != state.last_signature:
+            return True
+        if not state.progress_sent:
+            return True
+        return (time.monotonic() - state.last_progress_at) >= self._PROGRESS_STALE_SECONDS
+
     async def _publish_progress(self, state: SubagentTaskState, *, done: bool) -> None:
         content = self._format_state(state, include_id=False)
+        state.last_signature = self._state_signature(state)
+        state.last_progress_at = time.monotonic()
         await self.bus.publish_outbound(OutboundMessage(
             channel=state.origin_channel,
             chat_id=state.origin_chat_id,
@@ -472,7 +514,9 @@ class SubagentManager:
         status: str,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
-        status_text = "completed successfully" if status == "ok" else "failed"
+        ok = status == "ok"
+        status_text = "completed successfully" if ok else "failed"
+        headline = "✅ 后台任务已完成" if ok else "❌ 后台任务失败"
 
         announce_content = f"""[Subagent '{label}' {status_text}]
 
@@ -481,7 +525,17 @@ Task: {task}
 Result:
 {result}
 
-Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not mention technical details like "subagent" or task IDs."""
+---
+向用户播报时按以下结构，不要压缩成一两句白开水：
+
+1. 开头单独一行先报状态：「{headline}：{label}」
+2. 接着给这次任务的结果报告 —— 关键结论、产出物的具体路径/文件名、
+   验收或校验情况；失败时说明卡在哪一步、已完成到什么程度。
+   长度按内容复杂度自适应，宁可多给证据也不要含糊带过。
+3. 报告结束后，如果用户此前还有未回应的问题或正在进行的话题，继续把它回答完。
+
+排版遵循既有规范（结论先行、必要处穿插 text_tag / number_tag 着色，克制使用）。
+不要提及 "subagent"、任务 ID 等内部实现细节。"""
 
         # Inject as system message to trigger main agent
         msg = InboundMessage(
