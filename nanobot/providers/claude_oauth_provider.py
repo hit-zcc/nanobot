@@ -187,6 +187,21 @@ def _load_claude_code_token() -> dict[str, Any] | None:
     return _parse_claude_code_credentials(raw, SOURCE_KEYCHAIN) if raw else None
 
 
+def _most_refreshable(*candidates: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Pick the expired token whose refresh token is most likely to still work.
+
+    Anthropic rotates the refresh token on every refresh, which invalidates the
+    previous one. So among expired candidates the freshest — the one that
+    expired most recently — carries the refresh token least likely to have been
+    rotated out from under us by whichever client refreshed last. Candidates are
+    weighed in argument order, so an exact tie keeps the caller's preference.
+    """
+    usable = [c for c in candidates if c and c.get("refresh_token")]
+    if not usable:
+        return next((c for c in candidates if c), None)
+    return max(usable, key=lambda c: c.get("expires_at", 0))
+
+
 def _load_token() -> dict[str, Any] | None:
     """Load persisted OAuth token, falling back to Claude Code's credentials.
 
@@ -210,7 +225,11 @@ def _load_token() -> dict[str, Any] | None:
     if claude_code and time.time() < claude_code.get("expires_at", 0) - _EXPIRY_SKEW_SECONDS:
         return claude_code
     # Nothing is currently valid — hand back whatever can still be refreshed.
-    return fallback or claude_code
+    # Preferring the local copy unconditionally strands nanobot on a weeks-old
+    # refresh token whenever both stores are expired (a scheduled overnight run
+    # is the usual way to hit that), while the `claude` CLI's copy would still
+    # have refreshed fine.
+    return _most_refreshable(fallback, claude_code)
 
 
 def _save_token(data: dict[str, Any]) -> None:

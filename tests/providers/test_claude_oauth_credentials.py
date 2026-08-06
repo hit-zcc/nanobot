@@ -9,6 +9,7 @@ from nanobot.providers import claude_oauth_provider as mod
 
 LIVE = time.time() + 3600
 DEAD = time.time() - 3600
+LONG_DEAD = time.time() - 86400 * 18
 
 
 def _write_nanobot_token(path, expires_at):
@@ -74,6 +75,40 @@ def test_expired_local_token_returned_when_nothing_is_live(token_file):
     token = mod._load_token()
     assert token["access_token"] == "nanobot-token"
     assert "source" not in token
+
+
+def test_freshest_expired_token_wins_when_nothing_is_live(token_file, monkeypatch):
+    """Refresh tokens rotate, so the copy that died last is the one to retry.
+
+    A nanobot token left behind weeks ago holds a refresh token that whichever
+    client refreshed since has already rotated away; Claude Code's copy, expired
+    only hours ago, still refreshes.
+    """
+    _write_nanobot_token(token_file, LONG_DEAD)
+    monkeypatch.setattr(mod, "_read_claude_code_keychain", lambda: _keychain_blob(DEAD))
+
+    token = mod._load_token()
+    assert token["access_token"] == "cc-token"
+    assert token["source"] == mod.SOURCE_KEYCHAIN
+
+
+def test_local_token_wins_when_it_is_the_freshest_expired_one(token_file, monkeypatch):
+    _write_nanobot_token(token_file, DEAD)
+    monkeypatch.setattr(mod, "_read_claude_code_keychain", lambda: _keychain_blob(LONG_DEAD))
+
+    assert mod._load_token()["access_token"] == "nanobot-token"
+
+
+def test_expired_token_without_a_refresh_token_yields(token_file, monkeypatch):
+    """An access token with no way to renew it is dead weight, however fresh."""
+    token_file.write_text(json.dumps({
+        "access_token": "nanobot-token",
+        "expires_at": DEAD,
+        "token_type": "Bearer",
+    }))
+    monkeypatch.setattr(mod, "_read_claude_code_keychain", lambda: _keychain_blob(LONG_DEAD))
+
+    assert mod._load_token()["access_token"] == "cc-token"
 
 
 def test_no_credentials_anywhere(token_file):
