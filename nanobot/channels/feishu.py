@@ -451,6 +451,9 @@ class FeishuChannel(BaseChannel):
         # Feishu's at-least-once delivery can re-push old events with a fresh
         # message_id, which message_id dedup alone cannot catch.
         # NANOBOT_FEISHU_STALE_SECONDS=0 disables the age check.
+        # Bot's own open_id, used to tell "@this bot" from "@someone else".
+        # Resolved once at start() via GET /open-apis/bot/v3/info.
+        self._bot_open_id: str | None = None
         self._start_time_ms: int = int(time.time() * 1000)
         self._stale_threshold_ms: int = int(
             float(os.environ.get("NANOBOT_FEISHU_STALE_SECONDS", "120")) * 1000
@@ -489,6 +492,12 @@ class FeishuChannel(BaseChannel):
             .app_secret(self.config.app_secret) \
             .log_level(lark.LogLevel.INFO) \
             .build()
+        # Resolve identity before any event can arrive, so group mention
+        # filtering never runs on the degraded path.
+        self._bot_open_id = await asyncio.get_running_loop().run_in_executor(
+            None, self._fetch_bot_open_id_sync
+        )
+
         builder = lark.EventDispatcherHandler.builder(
             self.config.encrypt_key or "",
             self.config.verification_token or "",
@@ -578,18 +587,75 @@ class FeishuChannel(BaseChannel):
         self._running = False
         logger.info("Feishu bot stopped")
 
+    def _fetch_bot_open_id_sync(self) -> str | None:
+        """Resolve this bot's own ``open_id`` (blocking, called once at start).
+
+        Without it ``_is_bot_mentioned`` cannot tell "@this bot" from
+        "@a colleague" and answers every mention in the group.
+        """
+        import urllib.request
+
+        try:
+            token_req = urllib.request.Request(
+                "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                data=json.dumps(
+                    {"app_id": self.config.app_id, "app_secret": self.config.app_secret}
+                ).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(token_req, timeout=10) as resp:
+                token = json.loads(resp.read()).get("tenant_access_token")
+            if not token:
+                logger.warning("Feishu: could not obtain tenant_access_token for bot info")
+                return None
+
+            info_req = urllib.request.Request(
+                "https://open.feishu.cn/open-apis/bot/v3/info",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(info_req, timeout=10) as resp:
+                bot = json.loads(resp.read()).get("bot") or {}
+            open_id = str(bot.get("open_id") or "")
+            if open_id.startswith("ou_"):
+                logger.info(
+                    "Feishu: bot identity resolved: {} ({})", bot.get("app_name") or "?", open_id
+                )
+                return open_id
+            logger.warning("Feishu: bot info returned no usable open_id")
+        except Exception as e:  # noqa: BLE001 - identity lookup must never break startup
+            logger.warning("Feishu: failed to resolve bot open_id: {}", e)
+        return None
+
     def _is_bot_mentioned(self, message: Any) -> bool:
-        """Check if the bot is @mentioned in the message."""
+        """Check if *this* bot is @mentioned in the message.
+
+        The bot's own ``open_id`` is the only reliable discriminator.  Matching
+        on "mention has no user_id" instead treats **every** @mention in the
+        group as addressing the bot, because Feishu omits ``user_id`` for human
+        mentions too unless the app holds contact scopes.
+        """
         raw_content = message.content or ""
         if "@_all" in raw_content:
             return True
 
-        for mention in getattr(message, "mentions", None) or []:
+        mentions = getattr(message, "mentions", None) or []
+        if self._bot_open_id:
+            for mention in mentions:
+                mid = getattr(mention, "id", None)
+                if mid and str(getattr(mid, "open_id", None) or "") == self._bot_open_id:
+                    return True
+            return False
+
+        # Degraded path: identity lookup failed, fall back to the old heuristic
+        # rather than going silent in every group.
+        for mention in mentions:
             mid = getattr(mention, "id", None)
             if not mid:
                 continue
-            # Bot mentions have no user_id (None or "") but a valid open_id
             if not getattr(mid, "user_id", None) and (getattr(mid, "open_id", None) or "").startswith("ou_"):
+                logger.warning(
+                    "Feishu: bot open_id unknown, treating mention as addressed to this bot"
+                )
                 return True
         return False
 
