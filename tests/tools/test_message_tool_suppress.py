@@ -19,6 +19,18 @@ def _make_loop(tmp_path: Path) -> AgentLoop:
     return AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
 
 
+def _collect(sent: list[OutboundMessage]):
+    """替身发送回调：记录消息，并像 ChannelManager 那样回写投递回执。
+
+    message 工具现在要等回执才敢说"已发送"，替身不回写就会一直等到超时。
+    """
+    def _send(msg: OutboundMessage) -> None:
+        sent.append(msg)
+        if msg.delivery is not None and not msg.delivery.done():
+            msg.delivery.set_result((True, ""))
+    return _send
+
+
 class TestMessageToolSuppressLogic:
     """Final reply suppressed only when message tool sends to the same target."""
 
@@ -39,7 +51,7 @@ class TestMessageToolSuppressLogic:
         sent: list[OutboundMessage] = []
         mt = loop.tools.get("message")
         if isinstance(mt, MessageTool):
-            mt.set_send_callback(AsyncMock(side_effect=lambda m: sent.append(m)))
+            mt.set_send_callback(AsyncMock(side_effect=_collect(sent)))
 
         msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Send")
         result = await loop._process_message(msg)
@@ -64,7 +76,7 @@ class TestMessageToolSuppressLogic:
         sent: list[OutboundMessage] = []
         mt = loop.tools.get("message")
         if isinstance(mt, MessageTool):
-            mt.set_send_callback(AsyncMock(side_effect=lambda m: sent.append(m)))
+            mt.set_send_callback(AsyncMock(side_effect=_collect(sent)))
 
         msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Send email")
         result = await loop._process_message(msg)

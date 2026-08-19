@@ -1,9 +1,14 @@
 """Message tool for sending messages to users."""
 
+import asyncio
 from typing import Any, Awaitable, Callable
 
 from nanobot.agent.tools.base import Tool
 from nanobot.bus.events import OutboundMessage
+
+# 等投递回执的上限。附件要先上传再发消息，比纯文本慢得多，
+# 所以给得比较宽；超时只是"没等到回执"，不代表一定失败。
+_DELIVERY_TIMEOUT_S = 60.0
 
 
 class MessageTool(Tool):
@@ -94,6 +99,14 @@ class MessageTool(Tool):
         if not self._send_callback:
             return "Error: Message sending not configured"
 
+        # 🔴 挂一个投递回执 Future。没有它，publish_outbound 只是入队就返回，
+        # 工具永远返回"已发送"——哪怕消息根本没投出去（飞书 230002 等）。
+        # 这是"假完成态"的机制来源：不是忘了检查，是回执本身在撒谎。
+        try:
+            delivery: asyncio.Future | None = asyncio.get_running_loop().create_future()
+        except RuntimeError:
+            delivery = None
+
         msg = OutboundMessage(
             channel=channel,
             chat_id=chat_id,
@@ -102,13 +115,40 @@ class MessageTool(Tool):
             metadata={
                 "message_id": message_id,
             },
+            delivery=delivery,
         )
 
+        media_info = f" with {len(media)} attachments" if media else ""
         try:
             await self._send_callback(msg)
-            if channel == self._default_channel and chat_id == self._default_chat_id:
-                self._sent_in_turn = True
-            media_info = f" with {len(media)} attachments" if media else ""
-            return f"Message sent to {channel}:{chat_id}{media_info}"
         except Exception as e:
             return f"Error sending message: {str(e)}"
+
+        if delivery is None:
+            # 没有事件循环（同步测试等），退回旧行为并说清楚。
+            self._mark_sent(channel, chat_id)
+            return f"Message queued to {channel}:{chat_id}{media_info} (delivery unconfirmed)"
+
+        try:
+            ok, detail = await asyncio.wait_for(delivery, timeout=_DELIVERY_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            return (
+                f"⚠️ Delivery to {channel}:{chat_id}{media_info} did NOT confirm "
+                f"within {_DELIVERY_TIMEOUT_S:.0f}s. Do not tell the user it was sent."
+            )
+        except Exception as e:
+            return f"Error awaiting delivery to {channel}:{chat_id}: {e}"
+
+        if ok:
+            self._mark_sent(channel, chat_id)
+            return f"Message delivered to {channel}:{chat_id}{media_info}"
+        return (
+            f"❌ Delivery FAILED to {channel}:{chat_id}{media_info}: {detail}. "
+            f"The user did NOT receive this. Do not claim it was sent; "
+            f"check the target id and report the failure."
+        )
+
+    def _mark_sent(self, channel: str, chat_id: str) -> None:
+        """记下本轮已经主动发过消息（用于抑制重复的收尾回复）。"""
+        if channel == self._default_channel and chat_id == self._default_chat_id:
+            self._sent_in_turn = True

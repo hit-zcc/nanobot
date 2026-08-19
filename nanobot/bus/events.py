@@ -34,5 +34,13 @@ class OutboundMessage:
     reply_to: str | None = None
     media: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # 投递回执。发送方（如 message 工具）可以挂一个 Future 上来，
+    # ChannelManager 投递完成后写入结果，让调用方知道**真的发出去了没有**。
+    #
+    # 为什么需要它：publish_outbound 只是 queue.put，立刻返回；真正的投递在
+    # 另一个协程里，失败时 channel 层只 logger.error。没有这个字段，工具层
+    # 无论如何都拿不到投递结果，只能谎报"已发送"。
+    # 用 Any 而不是 asyncio.Future 是为了不让 dataclass 依赖 asyncio。
+    delivery: Any = None
 
 

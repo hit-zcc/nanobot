@@ -185,6 +185,8 @@ class ChannelManager:
                     await self._send_with_retry(channel, msg)
                 else:
                     logger.warning("Unknown channel: {}", msg.channel)
+                    # 这条路径以前会让挂了回执的调用方一直等到超时。
+                    self._settle(msg, False, f"unknown channel {msg.channel!r}")
 
             except asyncio.TimeoutError:
                 continue
@@ -249,6 +251,20 @@ class ChannelManager:
         )
         return merged, non_matching
 
+    @staticmethod
+    def _settle(msg: OutboundMessage, ok: bool, detail: str = "") -> None:
+        """把投递结果写回发送方挂的 Future（没挂就什么都不做）。
+
+        必须在**所有**退出路径上调用，否则 message 工具会一直等到超时。
+        """
+        fut = getattr(msg, "delivery", None)
+        if fut is None or fut.done():
+            return
+        try:
+            fut.set_result((ok, detail))
+        except Exception:  # pragma: no cover - future 已被取消等
+            pass
+
     async def _send_with_retry(self, channel: BaseChannel, msg: OutboundMessage) -> None:
         """Send a message with retry on failure using exponential backoff.
 
@@ -259,8 +275,10 @@ class ChannelManager:
         for attempt in range(max_attempts):
             try:
                 await self._send_once(channel, msg)
+                self._settle(msg, True)
                 return  # Send succeeded
             except asyncio.CancelledError:
+                self._settle(msg, False, "cancelled")
                 raise  # Propagate cancellation for graceful shutdown
             except Exception as e:
                 if attempt == max_attempts - 1:
@@ -268,6 +286,7 @@ class ChannelManager:
                         "Failed to send to {} after {} attempts: {} - {}",
                         msg.channel, max_attempts, type(e).__name__, e
                     )
+                    self._settle(msg, False, f"{type(e).__name__}: {e}")
                     return
                 delay = _SEND_RETRY_DELAYS[min(attempt, len(_SEND_RETRY_DELAYS) - 1)]
                 logger.warning(
