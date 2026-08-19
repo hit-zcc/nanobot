@@ -323,7 +323,17 @@ class LLMProvider(ABC):
             if not self._is_transient_error(response.content):
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
-                    logger.warning("Non-transient LLM error with image content, retrying without images")
+                    # Log what actually went wrong. Dropping the images makes
+                    # the retry succeed, so without this line the only trace
+                    # of a broken image pipeline is the model saying it cannot
+                    # see a file — which reads as a capability limit, not a
+                    # bug. One such fault (tool_result images never being
+                    # converted to Anthropic's shape) survived 804 fallbacks
+                    # precisely because the 400 was never written down.
+                    logger.warning(
+                        "Non-transient LLM error with image content, retrying without images: {}",
+                        str(response.content)[:400],
+                    )
                     response = await self._safe_chat_stream(**{**kw, "messages": stripped})
                     self._emit_log(kw, response, _t0, stream=True)
                     return response
@@ -381,7 +391,10 @@ class LLMProvider(ABC):
             if not self._is_transient_error(response.content):
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
-                    logger.warning("Non-transient LLM error with image content, retrying without images")
+                    logger.warning(
+                        "Non-transient LLM error with image content, retrying without images: {}",
+                        str(response.content)[:400],
+                    )
                     response = await self._safe_chat(**{**kw, "messages": stripped})
                     self._emit_log(kw, response, _t0, stream=False)
                     return response

@@ -125,14 +125,31 @@ class AnthropicProvider(LLMProvider):
 
         return system, self._merge_consecutive(raw)
 
-    @staticmethod
-    def _tool_result_block(msg: dict[str, Any]) -> dict[str, Any]:
+    @classmethod
+    def _tool_result_block(cls, msg: dict[str, Any]) -> dict[str, Any]:
         content = msg.get("content")
         block: dict[str, Any] = {
             "type": "tool_result",
             "tool_use_id": _sanitize_tool_id(msg.get("tool_call_id", "")),
         }
-        if isinstance(content, (str, list)):
+        if isinstance(content, list):
+            # A tool may return image blocks — read_file does, so that a
+            # picture reaches the model as a picture. Those blocks are in
+            # OpenAI's `image_url` shape and have to be translated here just
+            # as they are for user messages; passing them through verbatim
+            # earns a 400 ("Input tag 'image_url' found using 'type' does not
+            # match any of the expected tags"). The request then fails as a
+            # non-transient error, the retry layer strips every image and
+            # asks again, and the model receives `[image: /path]` — so the
+            # symptom is not an error at all but an agent calmly reporting it
+            # cannot see a file it was just handed.
+            block["content"] = [
+                cls._convert_image_block(item) or item
+                if isinstance(item, dict) and item.get("type") == "image_url"
+                else item
+                for item in content
+            ]
+        elif isinstance(content, str):
             block["content"] = content
         else:
             block["content"] = str(content) if content else ""
