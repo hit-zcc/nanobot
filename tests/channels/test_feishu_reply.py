@@ -284,8 +284,10 @@ async def test_send_uses_expected_feishu_msg_type_for_uploaded_files(
 
     send_calls: list[tuple[str, str, str, str]] = []
 
-    def _record_send(receive_id_type: str, receive_id: str, msg_type: str, content: str) -> None:
+    def _record_send(receive_id_type: str, receive_id: str, msg_type: str, content: str) -> str:
+        # 返回 message_id：真实实现成功时就返回它，替身不返回会被判成投递失败。
         send_calls.append((receive_id_type, receive_id, msg_type, content))
+        return "om_sent"
 
     with patch.object(channel, "_upload_file_sync", return_value="file-key"), patch.object(
         channel, "_send_message_sync", side_effect=_record_send
@@ -358,7 +360,9 @@ async def test_send_sanitizes_unresolved_mention_placeholder() -> None:
     with patch.object(
         channel,
         "_send_message_sync",
-        side_effect=lambda *args: sent.append(args),
+        # 真实的 _send_message_sync 成功时返回 message_id；替身也必须返回一个，
+        # 否则会被判成投递失败（list.append 返回 None）。
+        side_effect=lambda *args: (sent.append(args), "om_sent")[1],
     ):
         await channel.send(OutboundMessage(
             channel="feishu",
@@ -378,7 +382,9 @@ async def test_send_uses_native_text_mention_for_group_sender() -> None:
     with patch.object(
         channel,
         "_send_message_sync",
-        side_effect=lambda *args: sent.append(args),
+        # 真实的 _send_message_sync 成功时返回 message_id；替身也必须返回一个，
+        # 否则会被判成投递失败（list.append 返回 None）。
+        side_effect=lambda *args: (sent.append(args), "om_sent")[1],
     ):
         await channel.send(OutboundMessage(
             channel="feishu",
@@ -405,7 +411,9 @@ async def test_send_uses_native_post_mention_for_group_sender() -> None:
     with patch.object(
         channel,
         "_send_message_sync",
-        side_effect=lambda *args: sent.append(args),
+        # 真实的 _send_message_sync 成功时返回 message_id；替身也必须返回一个，
+        # 否则会被判成投递失败（list.append 返回 None）。
+        side_effect=lambda *args: (sent.append(args), "om_sent")[1],
     ):
         await channel.send(OutboundMessage(
             channel="feishu",
@@ -435,7 +443,9 @@ async def test_send_uses_native_card_mention_for_group_sender() -> None:
     with patch.object(
         channel,
         "_send_message_sync",
-        side_effect=lambda *args: sent.append(args),
+        # 真实的 _send_message_sync 成功时返回 message_id；替身也必须返回一个，
+        # 否则会被判成投递失败（list.append 返回 None）。
+        side_effect=lambda *args: (sent.append(args), "om_sent")[1],
     ):
         await channel.send(OutboundMessage(
             channel="feishu",

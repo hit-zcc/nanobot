@@ -8,6 +8,7 @@ import pytest
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.channels import feishu
 from nanobot.channels.feishu import FeishuChannel, FeishuConfig, _FeishuStreamBuf
 
 
@@ -114,20 +115,30 @@ class TestCloseStreamingMode:
 
 
 class TestStreamUpdateText:
-    def test_returns_true_on_success(self):
+    def test_reports_ok_on_success(self):
         ch = _make_channel()
         ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response(True)
-        assert ch._stream_update_text_sync("card_1", "hello", 1) is True
+        assert ch._stream_update_text_sync("card_1", "hello", 1) == feishu._STREAM_OK
 
-    def test_returns_false_on_failure(self):
+    def test_reports_failed_on_failure(self):
         ch = _make_channel()
         ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response(False)
-        assert ch._stream_update_text_sync("card_1", "hello", 1) is False
+        assert ch._stream_update_text_sync("card_1", "hello", 1) == feishu._STREAM_FAILED
 
-    def test_returns_false_on_exception(self):
+    def test_reports_failed_on_exception(self):
         ch = _make_channel()
         ch._client.cardkit.v1.card_element.content.side_effect = RuntimeError("err")
-        assert ch._stream_update_text_sync("card_1", "hello", 1) is False
+        assert ch._stream_update_text_sync("card_1", "hello", 1) == feishu._STREAM_FAILED
+
+    @pytest.mark.parametrize("code", [200850, 300309])
+    def test_reports_dead_once_feishu_closed_the_stream(self, code):
+        """Retrying these on the same card is pointless — it will never take another
+        update. The caller has to move the rest of the answer to a new card."""
+        ch = _make_channel()
+        resp = _mock_content_response(False)
+        resp.code = code
+        ch._client.cardkit.v1.card_element.content.return_value = resp
+        assert ch._stream_update_text_sync("card_1", "hello", 1) == feishu._STREAM_DEAD
 
 
 class TestSendDelta:
@@ -399,3 +410,31 @@ class TestToolProgressMessages:
         ch._client.im.v1.message.reply.assert_called_once()
         ch._client.im.v1.message.create.assert_not_called()
         assert ch._tool_progress_messages["progress-1"] == "om_reply_progress"
+
+
+class TestSanitizeCardMarkup:
+    """Markup the model gets wrong that the card `markdown` element rejects (code 11311)."""
+
+    def test_rewrites_font_tag_with_known_color(self):
+        out = feishu._sanitize_card_markup("<font color='red'>警告</font>文本")
+        assert out == "<text_tag color='red'>警告</text_tag>文本"
+
+    def test_drops_font_tag_with_unknown_color(self):
+        out = feishu._sanitize_card_markup("<font color='pink'>警告</font>文本")
+        assert out == "警告文本"
+
+    def test_drops_text_tag_with_unknown_color(self):
+        out = feishu._sanitize_card_markup("<text_tag color='pink'>警告</text_tag>文本")
+        assert out == "警告文本"
+
+    def test_drops_number_tag_with_unknown_color(self):
+        out = feishu._sanitize_card_markup("<number_tag color='magenta'>1</number_tag>步骤")
+        assert out == "1步骤"
+
+    def test_keeps_text_tag_with_known_color(self):
+        text = "<text_tag color='blue'>信息</text_tag>"
+        assert feishu._sanitize_card_markup(text) == text
+
+    def test_leaves_plain_text_untouched(self):
+        text = "普通文本，没有任何标签"
+        assert feishu._sanitize_card_markup(text) == text

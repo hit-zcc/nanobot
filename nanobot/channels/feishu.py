@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -306,6 +306,91 @@ def _sanitize_unresolved_mentions(text: str) -> str:
     return re.sub(r"@_user_\d+\b", "@用户", text)
 
 
+# Colors the card `text_tag`/`number_tag` elements actually accept. The model is
+# told to color with this palette but doesn't always stick to it: it sometimes
+# reaches for HTML-style `<font color=...>` instead, or emits `<text_tag>` /
+# `<number_tag>` directly with a color outside the list (e.g. 'pink'). Either
+# way the card `markdown` element rejects the tag outright (code 11311), and
+# that failure isn't recoverable by retrying: the same bad tag is still in the
+# buffered text next time, so it fails again on every subsequent write and the
+# streaming card sits frozen for the rest of the turn. Rewrite/strip it before
+# it ever reaches the API instead.
+_TEXT_TAG_COLORS = frozenset({
+    "neutral", "blue", "turquoise", "lime", "orange", "violet",
+    "indigo", "wathet", "green", "yellow", "red", "purple", "carmine",
+})
+_FONT_TAG_RE = re.compile(r"<font\s+color=(['\"])(\w+)\1\s*>(.*?)</font>", re.IGNORECASE | re.DOTALL)
+_COLOR_TAG_RE = re.compile(
+    r"<(text_tag|number_tag)\s+color=(['\"])(\w+)\2([^>]*)>(.*?)</\1>", re.IGNORECASE | re.DOTALL,
+)
+
+# `number_tag` is an unread-count badge, not a general colour block: the card
+# only accepts it with a `background_color` and a bare 1-99 integer inside.
+# Everything else -- no attributes, a `color=` attribute, a number over 99, any
+# non-digit content -- is rejected with 11311 (probed against the live CardKit
+# API on 2026-08-13). The model reaches for it to highlight counts, which are
+# almost always over 99, so nearly every use is fatal. Keep the one legal shape
+# and unwrap the rest.
+_NUMBER_TAG_RE = re.compile(r"<number_tag([^>]*)>(.*?)</number_tag>", re.IGNORECASE | re.DOTALL)
+_BACKGROUND_COLOR_RE = re.compile(r"background_color=(['\"])(\w+)\1", re.IGNORECASE)
+# Last-resort strip: the card-specific tags, whatever attributes they carry.
+# Scoped to these three on purpose. They are the ones the card parses and can
+# therefore reject; a tag it has no opinion about (`<weird_tag>`) is accepted
+# as literal text, so widening this would mangle content for no gain.
+_ANY_CARD_TAG_RE = re.compile(
+    r"</?(?:text_tag|number_tag|font)(?:\s[^>]*)?>", re.IGNORECASE,
+)
+
+
+def _sanitize_font_tags(text: str) -> str:
+    """Rewrite `<font color=...>` into `<text_tag>`, or drop the tag if the color isn't one text_tag knows."""
+    def _replace(m: "re.Match") -> str:
+        color, inner = m.group(2).lower(), m.group(3)
+        if color in _TEXT_TAG_COLORS:
+            return f"<text_tag color='{color}'>{inner}</text_tag>"
+        return inner
+    return _FONT_TAG_RE.sub(_replace, text)
+
+
+def _sanitize_tag_colors(text: str) -> str:
+    """Drop `<text_tag>`/`<number_tag>` markup whose color isn't in the accepted list, keeping the inner text."""
+    def _replace(m: "re.Match") -> str:
+        tag, color, inner = m.group(1), m.group(3).lower(), m.group(5)
+        if color in _TEXT_TAG_COLORS:
+            return m.group(0)
+        return inner
+    return _COLOR_TAG_RE.sub(_replace, text)
+
+
+def _sanitize_number_tags(text: str) -> str:
+    """Unwrap `<number_tag>` unless it is in the one shape the card accepts."""
+    def _replace(m: "re.Match") -> str:
+        attrs, inner = m.group(1), m.group(2)
+        bg = _BACKGROUND_COLOR_RE.search(attrs)
+        legal = (
+            bg is not None
+            and bg.group(2).lower() in _TEXT_TAG_COLORS
+            and inner.isdigit()
+            and 1 <= int(inner) <= 99
+        )
+        return m.group(0) if legal else inner
+    return _NUMBER_TAG_RE.sub(_replace, text)
+
+
+def _sanitize_card_markup(text: str) -> str:
+    """Rewrite/strip the markup the model most often gets wrong before it reaches the card API."""
+    return _sanitize_number_tags(_sanitize_tag_colors(_sanitize_font_tags(text)))
+
+
+def _strip_card_markup(text: str) -> str:
+    """Drop every card-specific tag, keeping the words inside.
+
+    The last resort for content the card rejects: a plain-text answer is ugly,
+    a frozen card is unreadable.
+    """
+    return _ANY_CARD_TAG_RE.sub("", text)
+
+
 _LEADING_DISPLAY_MENTION_RE = re.compile(r"^\s*@([^\s,，:：]+)[\s,，:：]*")
 
 
@@ -330,6 +415,15 @@ class FeishuConfig(Base):
     group_policy: Literal["open", "mention"] = "mention"
     reply_to_message: bool = False  # If True, bot replies quote the user's original message
     streaming: bool = True
+    single_card_per_turn: bool = Field(
+        default=True,
+        description=(
+            "Keep one streaming card alive across tool calls, so a turn that pauses to "
+            "run tools resumes in the same card instead of opening a new one. The agent "
+            "loop already reports whether a stream end is a pause or the real end; "
+            "without this, every pause was treated as the end."
+        ),
+    )
     progress_notify_interval_s: int = Field(
         default=120,
         ge=0,
@@ -352,6 +446,33 @@ class FeishuConfig(Base):
 
 _STREAM_ELEMENT_ID = "streaming_md"
 
+# Feishu ends a card's streaming session on its own — 200850 when the card sat
+# too long without an update, 300309 for every write after that. Neither is
+# recoverable on that card: it will never accept another update, so the answer
+# has to continue in a new one.
+_STREAM_DEAD_CODES = frozenset({200850, 300309})
+# The card could not parse the markdown it was sent. Unlike a network hiccup
+# this never heals on its own: the streaming buffer is cumulative, so the
+# offending markup is re-sent with every later frame and every one of them
+# fails too. One bad tag freezes the card for the rest of the turn unless
+# something strips it out. See ``_stream_write``.
+_STREAM_MARKUP_CODES = frozenset({11311})
+_STREAM_OK = "ok"
+_STREAM_DEAD = "dead"
+_STREAM_FAILED = "failed"
+_STREAM_BAD_MARKUP = "bad_markup"
+
+
+def _stream_turn_id(meta: dict[str, Any]) -> str:
+    """The turn a stream delta belongs to.
+
+    The agent loop stamps deltas with ``<turn>:<segment>``, one segment per
+    pause for tools. Everything a single turn says shares the prefix, so that is
+    what identifies the card it is being written into.
+    """
+    stream_id = str(meta.get("_stream_id") or "")
+    return stream_id.rsplit(":", 1)[0] if stream_id else ""
+
 
 @dataclass
 class _FeishuStreamBuf:
@@ -362,6 +483,20 @@ class _FeishuStreamBuf:
     card_id: str | None = None
     sequence: int = 0
     last_edit: float = 0.0
+    # How much of ``text`` the live card actually rendered. Only used when a card
+    # dies mid-answer: its successor picks up from here instead of repeating
+    # everything the dead card is still showing.
+    rendered: int = 0
+    # Which turn opened this card, so a later turn can tell an inherited card
+    # from its own. See the stale-card guard in ``send_delta``.
+    turn_id: str = ""
+    # Set when a turn pauses for tools. Now that the whole turn lives in one
+    # card, the seams where it stopped to work are invisible and everything
+    # reads as one wall of text; the next segment opens with a rule instead.
+    needs_separator: bool = False
+    # 同一张卡的 sequence 必须严格递增。写入路径不止一条，锁保证「取号 + 写入」
+    # 整体串行，飞书才不会因为乱序丢帧。
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class FeishuChannel(BaseChannel):
@@ -380,6 +515,10 @@ class FeishuChannel(BaseChannel):
     display_name = "Feishu"
 
     _STREAM_EDIT_INTERVAL = 0.5  # throttle between CardKit streaming updates
+    # How long an open card may go untouched before a tool heartbeat re-pushes it.
+    # Well under the silence Feishu tolerates, and above the ~2 min heartbeat
+    # ceiling so a busy turn does not re-push on every single beat.
+    _STREAM_KEEPALIVE_INTERVAL = 90.0
     _STREAM_LEADING_MENTION_RE = re.compile(
         r"^\s*@([^\s,，:：]+)[\s,，:：]+"
     )
@@ -814,6 +953,7 @@ class FeishuChannel(BaseChannel):
 
     def _build_card_elements(self, content: str) -> list[dict]:
         """Split content into div/markdown + table elements for Feishu card."""
+        content = _sanitize_card_markup(content)
         elements, last_end = [], 0
         for m in self._TABLE_RE.finditer(content):
             before = content[last_end:m.start()]
@@ -1322,9 +1462,12 @@ class FeishuChannel(BaseChannel):
                 ).build()
             response = self._client.im.v1.message.create(request)
             if not response.success():
+                # 🔴 目标地址只在成功时才打过，导致失败根本没法诊断
+                # （230002 到底发去了哪个 chat 全靠猜）。失败日志才最需要它。
                 logger.error(
-                    "Failed to send Feishu {} message: code={}, msg={}, log_id={}",
-                    msg_type, response.code, response.msg, response.get_log_id()
+                    "Failed to send Feishu {} message to {}={}: code={}, msg={}, log_id={}",
+                    msg_type, receive_id_type, receive_id,
+                    response.code, response.msg, response.get_log_id()
                 )
                 return None
             msg_id = getattr(response.data, "message_id", None)
@@ -1359,6 +1502,144 @@ class FeishuChannel(BaseChannel):
         except Exception as e:
             logger.warning("Error updating Feishu progress message {}: {}", message_id, e)
             return False
+
+    async def _stream_write(
+        self,
+        buf: _FeishuStreamBuf,
+        content: str,
+        loop: asyncio.AbstractEventLoop,
+        *,
+        element_id: str = _STREAM_ELEMENT_ID,
+    ) -> str | None:
+        """串行地往卡片写一次内容。
+
+        同一张卡的 sequence 必须严格递增，而写入这张卡的路径不止一条。锁保证
+        「取号 + 写入」整体串行，飞书才不会因为乱序丢帧。
+        """
+        async with buf.lock:
+            card_id = buf.card_id
+            if not card_id:
+                return None
+            buf.sequence += 1
+            seq = buf.sequence
+            result = await loop.run_in_executor(
+                None, self._stream_update_text_sync, card_id, _sanitize_card_markup(content), seq, element_id,
+            )
+            if result == _STREAM_BAD_MARKUP:
+                result = await self._retry_without_markup(
+                    buf, content, loop, card_id=card_id, element_id=element_id,
+                )
+        self._note_stream_write(buf, result)
+        return result
+
+    async def _retry_without_markup(
+        self,
+        buf: _FeishuStreamBuf,
+        content: str,
+        loop: asyncio.AbstractEventLoop,
+        *,
+        card_id: str,
+        element_id: str,
+    ) -> str:
+        """Re-send this frame as plain text after the card rejected its markup.
+
+        ``_sanitize_card_markup`` only knows about the mistakes we have already
+        met; the model keeps inventing new ones. Whatever it was, the buffer is
+        cumulative, so leaving it in place means every remaining frame of the
+        turn fails identically and the card stops moving — which reads to the
+        user as the bot hanging. Falling back to plain text costs some colour;
+        not falling back costs the rest of the answer.
+
+        Must be called with ``buf.lock`` held: it takes its own sequence number.
+        """
+        plain = _strip_card_markup(content)
+        if plain == content:
+            # Nothing tag-shaped to remove, so the card is objecting to
+            # something else. Don't burn another call guessing.
+            return _STREAM_FAILED
+        buf.sequence += 1
+        result = await loop.run_in_executor(
+            None, self._stream_update_text_sync, card_id, plain, buf.sequence, element_id,
+        )
+        if result != _STREAM_OK:
+            return result
+        logger.warning(
+            "Feishu rejected the card markup; card {} continues as plain text", card_id,
+        )
+        if content == buf.text:
+            # Disarm it for good. The buffer is what every later frame re-sends,
+            # so unless the bad markup leaves it now, the next frame re-poisons
+            # the card and we pay for this recovery again and again.
+            buf.text = plain
+        return _STREAM_OK
+
+    async def _stream_close(
+        self, buf: _FeishuStreamBuf, loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """关掉卡片的 streaming_mode，同样要串行取号。"""
+        async with buf.lock:
+            card_id = buf.card_id
+            if not card_id:
+                return
+            buf.sequence += 1
+            seq = buf.sequence
+            await loop.run_in_executor(
+                None, self._close_streaming_mode_sync, card_id, seq,
+            )
+
+    async def _open_stream_card(
+        self,
+        buf: _FeishuStreamBuf,
+        rid_type: str,
+        chat_id: str,
+        reply_message_id: str | None,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Open a card for this buffer and render everything it holds so far."""
+        card_id = await loop.run_in_executor(
+            None, self._create_streaming_card_sync, rid_type, chat_id, reply_message_id,
+        )
+        if not card_id:
+            return
+        buf.card_id = card_id
+        buf.sequence = 0
+        await self._stream_write(buf, buf.text, loop)
+        buf.last_edit = time.monotonic()
+
+    async def _seal_stale_card(
+        self, chat_id: str, loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Flush and close the card currently open for a chat, and forget it."""
+        stale = self._stream_bufs.pop(chat_id, None)
+        if not stale or not stale.card_id:
+            return
+        await self._stream_write(stale, stale.text, loop)
+        # A card Feishu already closed needs no sealing, and asking would only
+        # add a second failure to the log. Any other hiccup still gets sealed —
+        # an unsealed card leaves the chat list stuck on the typing placeholder.
+        if stale.card_id:
+            await self._stream_close(stale, loop)
+
+    async def _keepalive_stream_card(
+        self, chat_id: str, loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Re-push the open card's text so Feishu does not time its stream out.
+
+        With ``single_card_per_turn`` the card stays open across tool calls, and
+        a turn can spend many minutes inside one tool without producing a word.
+        Feishu reads that silence as an abandoned stream and closes it (200850),
+        after which the rest of the answer has nowhere to go. Tool heartbeats
+        arrive at most ~2 min apart, so piggybacking on them keeps the stream
+        alive through work of any length. The content is unchanged, so nothing
+        moves on screen.
+        """
+        buf = self._stream_bufs.get(chat_id)
+        if not buf or not buf.card_id or not buf.text:
+            return
+        if (time.monotonic() - buf.last_edit) < self._STREAM_KEEPALIVE_INTERVAL:
+            return
+        await self._stream_write(buf, buf.text, loop)
+        buf.last_edit = time.monotonic()
 
     async def _send_tool_progress(
         self,
@@ -1457,8 +1738,20 @@ class FeishuChannel(BaseChannel):
         from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
         card_json = {
             "schema": "2.0",
-            "config": {"wide_screen_mode": True, "update_multi": True, "streaming_mode": True},
-            "body": {"elements": [{"tag": "markdown", "content": "", "element_id": _STREAM_ELEMENT_ID}]},
+            "config": {
+                "wide_screen_mode": True,
+                "update_multi": True,
+                "streaming_mode": True,
+                # 打字机节奏：不指定时走默认值，出字偏慢且一顿一顿的。
+                "streaming_config": {
+                    "print_strategy": "fast",
+                    "print_frequency_ms": {"default": 30},
+                    "print_step": {"default": 2},
+                },
+            },
+            "body": {"elements": [
+                {"tag": "markdown", "content": "", "element_id": _STREAM_ELEMENT_ID},
+            ]},
         }
         try:
             request = CreateCardRequest.builder().request_body(
@@ -1493,25 +1786,70 @@ class FeishuChannel(BaseChannel):
             logger.warning("Error creating streaming card: {}", e)
             return None
 
-    def _stream_update_text_sync(self, card_id: str, content: str, sequence: int) -> bool:
-        """Stream-update the markdown element on a CardKit card (typewriter effect)."""
+    def _stream_update_text_sync(
+        self, card_id: str, content: str, sequence: int,
+        element_id: str = _STREAM_ELEMENT_ID,
+    ) -> str:
+        """Stream-update the markdown element on a CardKit card (typewriter effect).
+
+        Returns ``_STREAM_OK``, ``_STREAM_DEAD`` when Feishu has closed streaming
+        on this card (nothing will ever land on it again), or ``_STREAM_FAILED``
+        for a failure the same card may still recover from.
+        """
         from lark_oapi.api.cardkit.v1 import ContentCardElementRequest, ContentCardElementRequestBody
         try:
             request = ContentCardElementRequest.builder() \
                 .card_id(card_id) \
-                .element_id(_STREAM_ELEMENT_ID) \
+                .element_id(element_id) \
                 .request_body(
                     ContentCardElementRequestBody.builder()
                     .content(content).sequence(sequence).build()
                 ).build()
             response = self._client.cardkit.v1.card_element.content(request)
             if not response.success():
-                logger.warning("Failed to stream-update card {}: code={}, msg={}", card_id, response.code, response.msg)
-                return False
-            return True
+                if response.code in _STREAM_DEAD_CODES:
+                    logger.warning("Failed to stream-update card {}: code={}, msg={}", card_id, response.code, response.msg)
+                else:
+                    # Not a known dead-card code (e.g. 11311 markdown parse error) — log the
+                    # tail of the content too, since that's what actually says which bit of
+                    # markup Feishu choked on and _sanitize_card_markup missed.
+                    logger.warning(
+                        "Failed to stream-update card {}: code={}, msg={}; content_tail={!r}",
+                        card_id, response.code, response.msg, content[-300:],
+                    )
+                if response.code in _STREAM_DEAD_CODES:
+                    return _STREAM_DEAD
+                return _STREAM_BAD_MARKUP if response.code in _STREAM_MARKUP_CODES else _STREAM_FAILED
+            return _STREAM_OK
         except Exception as e:
             logger.warning("Error stream-updating card {}: {}", card_id, e)
+            return _STREAM_FAILED
+
+    def _note_stream_write(self, buf: _FeishuStreamBuf, result: Any) -> bool:
+        """Record how one streaming write went; retire the card if it died.
+
+        Feishu can close a card's streaming session under us (see
+        ``_STREAM_DEAD_CODES``), and every later write to it fails the same way.
+        Left unhandled the rest of the turn — and, since the buffer outlives it,
+        every later turn in this chat — is written into a card nobody can see
+        updating. So drop the dead card here: whatever it rendered stays put, the
+        buffer keeps only the tail that never made it, and the next delta opens a
+        fresh card to carry it.
+        """
+        if result == _STREAM_DEAD:
+            logger.warning(
+                "Feishu closed streaming on card {}; continuing in a new card", buf.card_id,
+            )
+            tail = buf.text[buf.rendered:] if buf.rendered < len(buf.text) else ""
+            buf.card_id = None
+            buf.sequence = 0
+            buf.text = tail
+            buf.rendered = 0
             return False
+        if result == _STREAM_FAILED:
+            return False
+        buf.rendered = len(buf.text)
+        return True
 
     def _close_streaming_mode_sync(self, card_id: str, sequence: int) -> bool:
         """Turn off CardKit streaming_mode so the chat list preview exits the streaming placeholder.
@@ -1563,21 +1901,34 @@ class FeishuChannel(BaseChannel):
 
         # --- stream end: final update or fallback ---
         if meta.get("_stream_end"):
-            buf = self._stream_bufs.pop(chat_id, None)
+            # A stream can end for two very different reasons: the turn is over, or
+            # the model paused to run tools and will keep talking. Feishu was treating
+            # both as the end and sealing the card, so a turn with six tool calls
+            # arrived as six separate notifications. The loop has always said which
+            # is which via ``_resuming``; this side simply never read it.
+            resuming = bool(meta.get("_resuming")) and self.config.single_card_per_turn
+            buf = self._stream_bufs.get(chat_id) if resuming else self._stream_bufs.pop(chat_id, None)
             if not buf or not buf.text:
                 return
             self._finalize_stream_mention(buf, force=True)
+            if resuming:
+                # Flush what has been said so far, but leave streaming_mode on: the
+                # card stays open and the next segment continues growing it. With no
+                # card yet (nothing has rendered), keep the buffer and let the next
+                # delta create one — the real end always arrives with resuming unset,
+                # so nothing can be stranded here.
+                if buf.card_id:
+                    await self._stream_write(buf, buf.text, loop)
+                buf.needs_separator = bool(buf.text.strip())
+                return
             if buf.card_id:
-                buf.sequence += 1
-                await loop.run_in_executor(
-                    None, self._stream_update_text_sync, buf.card_id, buf.text, buf.sequence,
-                )
-                # Required so the chat list preview exits the streaming placeholder (Feishu streaming card docs).
-                buf.sequence += 1
-                await loop.run_in_executor(
-                    None, self._close_streaming_mode_sync, buf.card_id, buf.sequence,
-                )
-            else:
+                await self._stream_write(buf, buf.text, loop)
+                if buf.card_id:
+                    # Required so the chat list preview exits the streaming placeholder (Feishu streaming card docs).
+                    await self._stream_close(buf, loop)
+            # No card, or the card died on that last write: whatever is left
+            # unrendered still has to reach the chat, as an ordinary card.
+            if not buf.card_id and buf.text.strip():
                 first_chunk = True
                 for chunk in self._split_elements_by_table_limit(self._build_card_elements(buf.text)):
                     card = json.dumps({"config": {"wide_screen_mode": True}, "elements": chunk}, ensure_ascii=False)
@@ -1592,15 +1943,38 @@ class FeishuChannel(BaseChannel):
                     await loop.run_in_executor(None, self._send_message_sync, rid_type, chat_id, "interactive", card)
             return
 
+        # --- an interjection redirected the turn: seal the card that answered the
+        # old question, so the next one opens quoting the new message ---
+        if meta.get("_card_break"):
+            await self._seal_stale_card(chat_id, loop)
+
         # --- accumulate delta ---
+        turn_id = _stream_turn_id(meta)
         buf = self._stream_bufs.get(chat_id)
+        if buf is not None and turn_id and buf.turn_id and buf.turn_id != turn_id:
+            # A card from an earlier turn is still open here. Its turn should have
+            # closed it, but a turn that is cancelled or dies mid-flight cannot
+            # always run its own cleanup — and an inherited card is worse than no
+            # card, since a stale one Feishu has since closed swallows every later
+            # answer in this chat silently. Seal it and start clean.
+            logger.warning(
+                "Feishu: card from a previous turn still open in {}; sealing it", chat_id,
+            )
+            await self._seal_stale_card(chat_id, loop)
+            buf = None
         if buf is None:
             buf = _FeishuStreamBuf()
+            buf.turn_id = turn_id
             self._stream_bufs[chat_id] = buf
             mention_target = self._outbound_mention_target(meta)
             if mention_target:
                 buf.mention_target = mention_target
                 buf.mention_pending = True
+        if buf.needs_separator and delta.strip():
+            # Only once the next segment actually has content: a rule that opens
+            # nothing would leave the card ending on a dangling line.
+            buf.needs_separator = False
+            buf.text = buf.text.rstrip() + "\n\n---\n\n"
         buf.text += delta
         if not buf.text.strip():
             return
@@ -1609,18 +1983,15 @@ class FeishuChannel(BaseChannel):
 
         now = time.monotonic()
         if buf.card_id is None:
-            card_id = await loop.run_in_executor(
-                None, self._create_streaming_card_sync, rid_type, chat_id, reply_message_id,
-            )
-            if card_id:
-                buf.card_id = card_id
-                buf.sequence = 1
-                await loop.run_in_executor(None, self._stream_update_text_sync, card_id, buf.text, 1)
-                buf.last_edit = now
+            await self._open_stream_card(buf, rid_type, chat_id, reply_message_id, loop)
         elif (now - buf.last_edit) >= self._STREAM_EDIT_INTERVAL:
-            buf.sequence += 1
-            await loop.run_in_executor(None, self._stream_update_text_sync, buf.card_id, buf.text, buf.sequence)
+            await self._stream_write(buf, buf.text, loop)
             buf.last_edit = now
+            if buf.card_id is None and buf.text.strip():
+                # That write killed the card. Open its replacement now rather than
+                # holding the tail back until whenever the next delta arrives —
+                # the turn may well be about to pause for a long tool call.
+                await self._open_stream_card(buf, rid_type, chat_id, reply_message_id, loop)
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu, including media (images/files) if present."""
@@ -1638,6 +2009,7 @@ class FeishuChannel(BaseChannel):
             loop = asyncio.get_running_loop()
 
             if msg.metadata.get("_tool_progress_id"):
+                await self._keepalive_stream_card(msg.chat_id, loop)
                 await self._send_tool_progress(msg, receive_id_type, loop)
                 return
 
@@ -1679,6 +2051,15 @@ class FeishuChannel(BaseChannel):
                     # A click on this message reports only its message_id, so
                     # remember which session sent it (see _on_card_action).
                     self._remember(self._outbound_routes, sent_id, msg.chat_id)
+                    return
+                # 🔴 两条路都失败了 —— 必须抛，不能静默返回。
+                # 以前这里 return None，于是：①manager 的重试永远不触发
+                # （它只在异常时重试）②message 工具照样返回"已发送"。
+                # 失败无声是所有"我说发了其实没发"的根源。
+                raise RuntimeError(
+                    f"Feishu rejected {m_type} message to "
+                    f"{receive_id_type}={msg.chat_id} (see log for code/log_id)"
+                )
 
             for file_path in msg.media:
                 if not os.path.isfile(file_path):
