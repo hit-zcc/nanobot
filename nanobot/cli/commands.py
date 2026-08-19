@@ -1044,6 +1044,40 @@ def agent(
 
 
 # ============================================================================
+# Config Commands
+# ============================================================================
+
+
+config_app = typer.Typer(help="Inspect configuration")
+app.add_typer(config_app, name="config")
+
+
+@config_app.command("dump")
+def config_dump(
+    config: str = typer.Option(None, "--config", "-c", help="Path to config file"),
+    changed_only: bool = typer.Option(
+        False, "--changed-only", help="Only show values set in the config file",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Machine-readable output"),
+):
+    """打印真正生效的配置，并标注每个值来自文件还是默认值。
+
+    回答的是「我改的那个值，是不是你正在用的那个值」——设过却显示 default 的键，
+    就是 bug 现场本身。密钥会脱敏，输出可以直接贴给别人看。
+    """
+    from nanobot.config.dump import build_dump, render_dump
+    from nanobot.config.loader import get_config_path
+
+    loaded = _load_runtime_config(config)
+    dump = build_dump(loaded, Path(config).expanduser().resolve() if config else get_config_path())
+
+    if as_json:
+        print(json.dumps(dump, ensure_ascii=False, indent=2))
+        return
+    print(render_dump(dump, show_defaults=not changed_only))
+
+
+# ============================================================================
 # Channel Commands
 # ============================================================================
 
