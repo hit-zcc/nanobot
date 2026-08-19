@@ -137,7 +137,13 @@ class SubagentManager:
         bg_task.add_done_callback(_cleanup)
 
         logger.info("Spawned subagent [{}]: {}", task_id, display_label)
-        return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
+        return (
+            f"Subagent [{display_label}] started (id: {task_id}) and is now running independently. "
+            "The task is fully delegated -- do not also perform it yourself in this turn, that "
+            "duplicates the work. Reply now with a brief acknowledgment that it's underway (or say "
+            "nothing further if there is nothing else to add) and stop; the result will arrive later "
+            "as its own report, you do not need to wait for it here."
+        )
 
     async def _run_subagent(
         self,
@@ -537,9 +543,16 @@ Result:
     def _build_subagent_prompt(self) -> str:
         """Build a focused system prompt for the subagent."""
         from nanobot.agent.context import ContextBuilder
+        from nanobot.utils.helpers import current_time_str
+        from nanobot.agent.knowledge_index import KnowledgeIndex
         from nanobot.agent.skills import SkillsLoader
 
-        time_ctx = ContextBuilder._build_runtime_context(None, None)
+        # Subagents get plain time context only: the boot notice is for the
+        # main agent's own continuity, and a fresh ContextBuilder here would
+        # also re-fire it on every spawn.
+        time_ctx = (
+            ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + f"Current Time: {current_time_str()}"
+        )
         parts = [f"""# Subagent
 
 {time_ctx}
@@ -561,6 +574,23 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
         skills_summary = SkillsLoader(self.workspace).build_skills_summary()
         if skills_summary:
             parts.append(f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}")
+
+        # A subagent starts with no history, so it cannot know which of these
+        # traps it is walking into — and it has no way to ask. Handing it the
+        # same index the main agent gets is the only thing standing between a
+        # confidently wrong report and a correct one.
+        notes_summary = KnowledgeIndex(self.workspace).build_summary()
+        if notes_summary:
+            parts.append(f"""## Working Notes
+
+Notes from earlier work on these systems: what went wrong before and what the right approach
+turned out to be. Each entry states **when it applies** — if the current step matches one, read
+that file with read_file before acting.
+
+Especially relevant when querying logs, checking release state, or reading an unfamiliar repo:
+a query returning "0 rows" or "success" is often the trap rather than the answer.
+
+{notes_summary}""")
 
         return "\n\n".join(parts)
 

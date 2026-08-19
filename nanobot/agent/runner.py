@@ -48,6 +48,11 @@ class AgentRunSpec:
     max_iterations_message: str | None = None
     iteration_warning_remaining: int | None = None
     iteration_warning_message: str | None = None
+    # Unlike iteration_warning_message (an out-of-band notice to the user),
+    # this is spliced into the conversation itself so the *model* reads it
+    # and can act on it — e.g. wrap up and hand back a summary instead of
+    # blindly running until the hard cutoff.
+    iteration_warning_directive: str | None = None
     concurrent_tools: bool = False
     fail_on_tool_error: bool = False
     # Live view of the working message list. When provided, the runner fills
@@ -121,6 +126,11 @@ class AgentRunner:
                         remaining_iterations=remaining_iterations,
                     ),
                 )
+                if spec.iteration_warning_directive:
+                    messages.append({
+                        "role": "user",
+                        "content": spec.iteration_warning_directive,
+                    })
             kwargs: dict[str, Any] = {
                 "messages": messages,
                 "tools": spec.tools.get_definitions(),
@@ -246,11 +256,30 @@ class AgentRunner:
                     await hook.after_iteration(context)
                     break
                 for tool_call, result in zip(response.tool_calls, results):
+                    # A preflight recipe was resolved before this tool ran;
+                    # it rides on the result so the model reads both as one
+                    # thing. Appending is deliberate — prepending would push
+                    # the actual output below a wall of advice.
+                    # A tool result is not always a string: read_file returns
+                    # a list of content blocks so an image reaches the model
+                    # as an image. Formatting that into an f-string turns the
+                    # picture into a printed repr of its own base64 — the
+                    # model then sees text describing a list, and reports
+                    # being unable to see the image. Append into the block
+                    # list instead, and leave a result alone when its shape
+                    # is neither of the two known ones.
+                    note = context.preflight_notes.get(tool_call.id)
+                    content = result
+                    if note:
+                        if isinstance(result, str):
+                            content = result + note
+                        elif isinstance(result, list):
+                            content = [*result, {"type": "text", "text": note}]
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "name": tool_call.name,
-                        "content": result,
+                        "content": content,
                     })
 
                 # Interjection point: tool results are settled and the message

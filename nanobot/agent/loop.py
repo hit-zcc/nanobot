@@ -14,6 +14,8 @@ from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.tool_preflight import PreflightEngine, build_playbook_note
+from nanobot.agent.tool_triggers import TriggerEngine, build_reminder_message
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
@@ -120,6 +122,29 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
 
+        # Fires pitfall reminders after a tool settles; empty (and free) when
+        # workspace/rules/tool-triggers.yaml is absent.
+        self.tool_triggers = TriggerEngine.load(
+            workspace / "rules" / "tool-triggers.yaml",
+            log_path=workspace / "logs" / "tool-triggers.jsonl",
+        )
+        # Triggers authored inline, on the line below the note they guard.
+        # Without this call the whole inline syntax is dead code: the notes
+        # carry `<!-- t: ... -->` markers that nothing ever reads, which is
+        # worse than having no reminders at all — the markers make it look
+        # like the knowledge is armed when it is not.
+        self.tool_triggers.absorb_knowledge_dir(workspace / "knowledge")
+
+        # The other end of the same problem: reminders fire after a tool
+        # settles, which is too late for a command that was malformed to
+        # begin with. Preflight hands over the recipe while the call can
+        # still be changed. Deterministic only by default — layer 2 costs
+        # latency on a blocking path, so it stays off until asked for.
+        self.tool_preflight = PreflightEngine.load(
+            workspace / "knowledge",
+            log_path=workspace / "logs" / "tool-preflight.jsonl",
+        )
+
         self.context = ContextBuilder(workspace, timezone=timezone)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
@@ -157,6 +182,11 @@ class AgentLoop:
         # spliced into that run at its next tool boundary rather than queued
         # behind it, so the user can steer or interrupt long jobs.
         self._pending_injections: dict[str, list[InboundMessage]] = {}
+        # An interjection redirects the work, so from that point on the answer is
+        # addressed to *it*, not to the question that opened the turn. Remember
+        # what to quote, and that the current card should be sealed first.
+        self._injection_reply_meta: dict[str, dict[str, str]] = {}
+        self._card_break: set[str] = set()
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
@@ -312,6 +342,7 @@ class AgentLoop:
         message_sink: list[dict] | None = None,
         injection_key: str | None = None,
         on_checkpoint: Callable[[list[dict]], None] | None = None,
+        session_key: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop.
 
@@ -321,6 +352,10 @@ class AgentLoop:
         at tool boundaries, letting the user steer a run already in flight.
         *on_checkpoint*: called at each iteration boundary with the live message
         list so the caller can persist progress before the turn completes.
+        *session_key*: scopes the once-per-session state of the preflight and
+        trigger engines. Those engines live for the whole process, so without
+        a key a reminder that fired in one chat would stay silent in every
+        other chat, cron run and heartbeat tick until a restart.
 
         *on_stream*: called with each content delta during streaming.
         *on_stream_end(resuming)*: called when a streaming session finishes.
@@ -328,6 +363,9 @@ class AgentLoop:
         ``resuming=False`` means this is the final response.
         """
         loop_self = self
+        # Fall back to the routing key, then to the origin, so every call site
+        # lands in *some* per-conversation bucket rather than a global one.
+        dedup_key = session_key or injection_key or f"{channel}:{chat_id}"
 
         class _LoopHook(AgentHook):
             def __init__(self) -> None:
@@ -367,6 +405,27 @@ class AgentLoop:
                     logger.info("Tool call: {}({})", tc.name, args_str[:200])
                 loop_self._set_tool_context(channel, chat_id, message_id)
 
+                # Look the recipe up now, while the arguments are known and
+                # nothing has run yet. It is attached to the result further
+                # down rather than emitted here: a note that arrives before
+                # its own tool result reads as commentary on the previous
+                # step, and the model has to work out what it refers to.
+                notes: dict[str, str] = {}
+                for tc in context.tool_calls:
+                    books = loop_self.tool_preflight.check(
+                        tc.name, tc.arguments, session_key=dedup_key,
+                    )
+                    if not books:
+                        continue
+                    note = build_playbook_note(books)
+                    if note:
+                        notes[tc.id] = note
+                        logger.info(
+                            "tool-preflight: {} for {} ({})",
+                            books[0].playbook_id, tc.name, books[0].title or "-",
+                        )
+                context.preflight_notes = notes
+
             async def on_notice(self, context: AgentHookContext, message: str) -> None:
                 if on_notice:
                     await on_notice(message)
@@ -374,14 +433,37 @@ class AgentLoop:
                     await on_progress(message)
 
             async def take_injections(self, context: AgentHookContext) -> list[dict[str, Any]]:
+                out: list[dict[str, Any]] = []
+
+                # Pitfall reminders first: the tool results are settled, so a
+                # rule can match on what actually came back, and the nudge lands
+                # before the model reasons about it. Silent by design — this is
+                # the agent's own note-to-self, not something to page the user
+                # about.
+                for tool_call, result in zip(context.tool_calls, context.tool_results):
+                    reminders = loop_self.tool_triggers.check(
+                        tool_call.name, tool_call.arguments, result,
+                        session_key=dedup_key,
+                    )
+                    if not reminders:
+                        continue
+                    message = build_reminder_message(reminders)
+                    if message is not None:
+                        logger.info(
+                            "tool-triggers: {} reminder(s) after {}",
+                            len(reminders), tool_call.name,
+                        )
+                        out.append(message)
+
                 if not injection_key:
-                    return []
+                    return out
                 pending = loop_self._take_injections(injection_key)
                 if not pending:
-                    return []
+                    return out
                 built = loop_self._build_injection_messages(pending)
                 if not built:
-                    return []
+                    return out
+                loop_self._retarget_replies_to(injection_key, pending[-1])
                 logger.info(
                     "Injecting {} interjection(s) into running turn for {}",
                     len(pending), injection_key,
@@ -389,7 +471,7 @@ class AgentLoop:
                 await self.on_notice(
                     context, "📨 收到你的新消息，已插进当前任务，我马上把它一起考虑。",
                 )
-                return built
+                return out + built
 
             async def on_tool_heartbeat(
                 self, context: AgentHookContext, *, elapsed: float, pending: list[str],
@@ -446,7 +528,13 @@ class AgentLoop:
             iteration_warning_message=(
                 "⚠️ 当前任务已使用 {used_iterations}/{max_iterations} 轮模型/工具循环，"
                 "距离硬限制只剩 {remaining_iterations} 轮。"
-                "我会开始收敛并优先汇报结果；若仍未完成，触顶时会明确说明。"
+                "我会先把目前完成的阶段性成果整理发给你确认，你回复后我再继续。"
+            ),
+            iteration_warning_directive=(
+                "[自动提醒 · 非用户发言] 当前任务已经接近本轮工具调用的硬限制，"
+                "请立刻停止调用任何工具。把目前已经完成的阶段性成果整理成一段"
+                "简明的总结，作为这次回复发给用户；发送后到此为止，等待用户"
+                "确认或给出下一步指示后再继续剩余工作。"
             ),
             refusal_message=(
                 "这条请求触发了模型的安全限制，我没法继续生成。"
@@ -544,6 +632,10 @@ class AgentLoop:
         tasks = self._active_tasks.get(key, [])
         if task in tasks:
             tasks.remove(task)
+        if not any(not t.done() for t in tasks):
+            # The turn is over; the next one starts by quoting its own message.
+            self._injection_reply_meta.pop(key, None)
+            self._card_break.discard(key)
         if not tasks:
             self._active_tasks.pop(key, None)
         if task.cancelled():
@@ -562,9 +654,29 @@ class AgentLoop:
         self._pending_injections.setdefault(key, []).append(msg)
         logger.info("Queued interjection for running turn in session {}", key)
 
+    _REPLY_KEYS = ("message_id", "root_id", "thread_id")
+
     def _take_injections(self, key: str) -> list[InboundMessage]:
-        """Remove and return the messages queued for *key*."""
+        """Remove and return the messages queued for *key*.
+
+        Deliberately free of side effects: three of the callers are draining the
+        queue to *discard* it (a cancelled run) or to restart it as a fresh turn,
+        not to fold it into an answer in flight. Retargeting replies from in here
+        leaked a stale quote into the following turn.
+        """
         return self._pending_injections.pop(key, [])
+
+    def _retarget_replies_to(self, key: str, msg: InboundMessage) -> None:
+        """Point the rest of this turn's replies at an interjection.
+
+        Called only where an interjection is spliced into a running turn: from
+        that moment the answer addresses the new message, so quoting the question
+        that opened the turn would aim the reader at the wrong thing.
+        """
+        meta = {k: msg.metadata[k] for k in self._REPLY_KEYS if msg.metadata.get(k)}
+        if meta:
+            self._injection_reply_meta[key] = meta
+            self._card_break.add(key)
 
     def _buffer_inbound(self, msg: InboundMessage) -> None:
         """Buffer a message and (re)start the per-session coalesce timer.
@@ -629,11 +741,24 @@ class AgentLoop:
                     # Carry the original message's reply-routing keys into the
                     # stream deltas so channels that quote/reply (e.g. Feishu
                     # streaming cards) can target the user's original message.
-                    reply_meta = {
+                    base_reply_meta = {
                         k: msg.metadata[k]
-                        for k in ("message_id", "root_id", "thread_id")
+                        for k in self._REPLY_KEYS
                         if msg.metadata.get(k)
                     }
+                    reply_key = self._dispatch_session_key(msg)
+
+                    def _reply_meta() -> dict[str, Any]:
+                        """Quote whatever the answer is currently addressing."""
+                        meta = dict(base_reply_meta)
+                        meta.update(self._injection_reply_meta.get(reply_key) or {})
+                        return meta
+
+                    def _take_card_break() -> bool:
+                        if reply_key not in self._card_break:
+                            return False
+                        self._card_break.discard(reply_key)
+                        return True
 
                     def _current_stream_id() -> str:
                         return f"{stream_base_id}:{stream_segment}"
@@ -643,9 +768,13 @@ class AgentLoop:
                             channel=msg.channel, chat_id=msg.chat_id,
                             content=delta,
                             metadata={
-                                **reply_meta,
+                                **_reply_meta(),
                                 "_stream_delta": True,
                                 "_stream_id": _current_stream_id(),
+                                # Consumed by the first delta only: the new card,
+                                # once opened, keeps growing like any other.
+                                **({"_card_break": True}
+                                   if _take_card_break() else {}),
                             },
                         ))
 
@@ -674,6 +803,18 @@ class AgentLoop:
                     ))
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", dispatch_key)
+                # A stopped turn still has to close its stream. Channels that
+                # keep one live surface per turn (Feishu's streaming card) hold
+                # that state until a stream end arrives; without one the card is
+                # left mid-answer forever, and the next turn in the same chat
+                # keeps writing into it instead of opening its own.
+                if on_stream_end is not None:
+                    try:
+                        await on_stream_end(resuming=False)
+                    except Exception:
+                        logger.exception(
+                            "Failed to close stream after cancellation for {}", dispatch_key,
+                        )
                 raise
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
@@ -766,6 +907,7 @@ class AgentLoop:
                     message_id=msg.metadata.get("message_id"),
                     message_sink=live_msgs,
                     on_checkpoint=_checkpoint,
+                    session_key=key,
                 )
             except asyncio.CancelledError:
                 self._save_cancelled_turn(session, live_msgs, cursor[0], key)
@@ -893,6 +1035,7 @@ class AgentLoop:
                 message_sink=live_msgs,
                 injection_key=self._dispatch_session_key(msg),
                 on_checkpoint=_checkpoint,
+                session_key=key,
             )
         except asyncio.CancelledError:
             # A stopped run must not silently swallow whatever the user sent

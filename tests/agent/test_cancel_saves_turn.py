@@ -175,6 +175,53 @@ class TestCancelledTurnPersisted:
         )  # must not raise
 
 
+class TestCancelledTurnClosesStream:
+    """A stopped turn must also close whatever surface it was streaming into.
+
+    Regression: `_dispatch` re-raised the cancellation without ever ending the
+    stream. Feishu keeps one card per turn and only lets go of it on a stream
+    end, so a stopped turn left its card open forever — and every later answer
+    in that chat was written into it instead of a card of its own. Once Feishu
+    timed that card's stream out, those answers stopped arriving at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancelled_turn_emits_a_final_stream_end(self, tmp_path):
+        from nanobot.bus.events import InboundMessage
+
+        loop = _make_loop(tmp_path)
+        loop._process_message = AsyncMock(side_effect=asyncio.CancelledError)
+
+        msg = InboundMessage(
+            channel="feishu", sender_id="u1", chat_id="c1", content="do task",
+            metadata={"_wants_stream": True},
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await loop._dispatch(msg)
+
+        published = []
+        while not loop.bus.outbound.empty():
+            published.append(loop.bus.outbound.get_nowait())
+        ends = [m for m in published if m.metadata.get("_stream_end")]
+        assert ends, "the cancelled turn never closed its stream"
+        assert ends[-1].metadata["_resuming"] is False, "a stopped turn is not resuming"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_close_does_not_mask_the_cancellation(self, tmp_path):
+        from nanobot.bus.events import InboundMessage
+
+        loop = _make_loop(tmp_path)
+        loop._process_message = AsyncMock(side_effect=asyncio.CancelledError)
+        loop.bus.publish_outbound = AsyncMock(side_effect=RuntimeError("bus is gone"))
+
+        msg = InboundMessage(
+            channel="feishu", sender_id="u1", chat_id="c1", content="do task",
+            metadata={"_wants_stream": True},
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await loop._dispatch(msg)
+
+
 class TestRunnerMessageSink:
     @pytest.mark.asyncio
     async def test_sink_receives_live_messages(self):

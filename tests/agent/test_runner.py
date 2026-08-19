@@ -266,6 +266,55 @@ async def test_runner_warns_once_when_iteration_limit_is_near():
 
 
 @pytest.mark.asyncio
+async def test_runner_injects_convergence_directive_near_iteration_limit():
+    """Near the hard limit, the model should be told—inside the conversation,
+
+    not just an out-of-band notice—to stop calling tools and hand back a
+    summary. If it complies, the run ends with real content instead of
+    silently grinding to the max_iterations fallback message.
+    """
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    seen_messages: list[list[dict]] = []
+
+    async def chat_with_retry(*, messages, **kwargs):
+        seen_messages.append(list(messages))
+        if len(seen_messages) < 3:
+            return LLMResponse(
+                content="still working",
+                tool_calls=[ToolCallRequest(id=f"call_{len(seen_messages)}", name="list_dir", arguments={})],
+            )
+        # Third call happens right after the directive was spliced in;
+        # the model "complies" by wrapping up with no further tool calls.
+        return LLMResponse(content="Here's what I've done so far: ...", tool_calls=[])
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="tool result")
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "do task"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=5,
+        iteration_warning_remaining=3,
+        iteration_warning_directive="please wrap up and summarize",
+    ))
+
+    assert result.stop_reason == "completed"
+    assert result.final_content == "Here's what I've done so far: ..."
+    # The directive must appear in the messages fed to the model on the very
+    # next call, or it never actually reaches the model.
+    assert seen_messages[2][-1] == {
+        "role": "user",
+        "content": "please wrap up and summarize",
+    }
+
+
+@pytest.mark.asyncio
 async def test_runner_surfaces_refusal_message_when_content_empty():
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
 

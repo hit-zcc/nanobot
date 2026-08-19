@@ -19,6 +19,10 @@ class AgentHookContext:
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     tool_results: list[Any] = field(default_factory=list)
     tool_events: list[dict[str, str]] = field(default_factory=list)
+    # Recipes looked up before the tools ran, keyed by tool_call id. Filled by
+    # a hook in before_execute_tools and consumed when the results are turned
+    # into messages, so the advice and the output it concerns arrive together.
+    preflight_notes: dict[str, str] = field(default_factory=dict)
     final_content: str | None = None
     stop_reason: str | None = None
     error: str | None = None

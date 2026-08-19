@@ -42,7 +42,9 @@ class SpawnTool(Tool):
             "Give the subagent the full context it needs -- it cannot see this conversation, "
             "and it cannot ask you follow-up questions. State the goal, the relevant paths, and "
             "what 'done' looks like. For deliverables or existing projects, inspect the "
-            "workspace first and use a dedicated subdirectory when helpful."
+            "workspace first and use a dedicated subdirectory when helpful. "
+            "Once spawned the task is fully delegated: do not also do it yourself in this turn "
+            "(that duplicates the work) -- acknowledge briefly and stop, then wait for its report."
         )
 
     @property

@@ -92,6 +92,18 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     session.clear()
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
+    # A new conversation re-arms the reminders. Their once-per-session state
+    # is keyed by session key, and /new keeps the key while discarding the
+    # history — so without this the fresh session inherits "already said
+    # that" from the conversation it replaced.
+    for engine, method in ((getattr(loop, "tool_triggers", None), "reset"),
+                           (getattr(loop, "tool_preflight", None), "reset_session")):
+        reset = getattr(engine, method, None)
+        if callable(reset):
+            try:
+                reset(session.key)
+            except Exception:  # never let a nicety break /new
+                logger.warning("/new: could not reset {}", method)
     if snapshot:
         loop._schedule_background(loop.memory_consolidator.archive_messages(snapshot))
     return OutboundMessage(
