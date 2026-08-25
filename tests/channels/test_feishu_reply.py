@@ -375,21 +375,20 @@ async def test_send_sanitizes_unresolved_mention_placeholder() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_uses_native_text_mention_for_group_sender() -> None:
+async def test_send_does_not_auto_mention_group_sender() -> None:
+    """群回复不再自动 @ 提问者 —— @ 谁由模型自己决定（2026-08-20 聪聪要求）。"""
     channel = _make_feishu_channel(reply_to_message=False)
     sent: list[tuple[str, str, str, str]] = []
 
     with patch.object(
         channel,
         "_send_message_sync",
-        # 真实的 _send_message_sync 成功时返回 message_id；替身也必须返回一个，
-        # 否则会被判成投递失败（list.append 返回 None）。
         side_effect=lambda *args: (sent.append(args), "om_sent")[1],
     ):
         await channel.send(OutboundMessage(
             channel="feishu",
             chat_id="oc_abc",
-            content="@wuw 查清楚了",
+            content="查清楚了",
             metadata={
                 "chat_type": "group",
                 "sender_type": "user",
@@ -398,27 +397,74 @@ async def test_send_uses_native_text_mention_for_group_sender() -> None:
         ))
 
     assert sent[0][2] == "text"
-    assert json.loads(sent[0][3])["text"] == (
-        '<at user_id="ou_alice">用户</at> 查清楚了'
-    )
+    body = json.loads(sent[0][3])["text"]
+    assert body == "查清楚了"
+    assert "<at" not in body
 
 
 @pytest.mark.asyncio
-async def test_send_uses_native_post_mention_for_group_sender() -> None:
+async def test_send_keeps_model_written_text_mention() -> None:
+    """模型自己写的 <at> 必须原样生效，且不会被追加第二个 @。"""
     channel = _make_feishu_channel(reply_to_message=False)
     sent: list[tuple[str, str, str, str]] = []
 
     with patch.object(
         channel,
         "_send_message_sync",
-        # 真实的 _send_message_sync 成功时返回 message_id；替身也必须返回一个，
-        # 否则会被判成投递失败（list.append 返回 None）。
         side_effect=lambda *args: (sent.append(args), "om_sent")[1],
     ):
         await channel.send(OutboundMessage(
             channel="feishu",
             chat_id="oc_abc",
-            content="@wuw 请看 [文档](https://example.com)",
+            content='<at user_id="ou_bob">牛小数</at> 在吗',
+            metadata={
+                "chat_type": "group",
+                "sender_type": "user",
+                "sender_open_id": "ou_alice",
+            },
+        ))
+
+    body = json.loads(sent[0][3])["text"]
+    assert body == '<at user_id="ou_bob">牛小数</at> 在吗'
+    assert body.count("<at") == 1
+
+
+@pytest.mark.asyncio
+async def test_text_mention_written_in_card_syntax_is_normalized() -> None:
+    """模型写成卡片语法 ``id=``，发 text 时要改写成 ``user_id=`` 才真的 @ 得到。"""
+    channel = _make_feishu_channel(reply_to_message=False)
+    sent: list[tuple[str, str, str, str]] = []
+
+    with patch.object(
+        channel,
+        "_send_message_sync",
+        side_effect=lambda *args: (sent.append(args), "om_sent")[1],
+    ):
+        await channel.send(OutboundMessage(
+            channel="feishu",
+            chat_id="oc_abc",
+            content='<at id="ou_bob"></at> 在吗',
+            metadata={"chat_type": "group", "sender_type": "user"},
+        ))
+
+    assert json.loads(sent[0][3])["text"] == '<at user_id="ou_bob">用户</at> 在吗'
+
+
+@pytest.mark.asyncio
+async def test_post_renders_model_written_mention_as_at_element() -> None:
+    """post 不认字符串形式的 <at>，必须转成 at 元素，否则整段标签露给用户看。"""
+    channel = _make_feishu_channel(reply_to_message=False)
+    sent: list[tuple[str, str, str, str]] = []
+
+    with patch.object(
+        channel,
+        "_send_message_sync",
+        side_effect=lambda *args: (sent.append(args), "om_sent")[1],
+    ):
+        await channel.send(OutboundMessage(
+            channel="feishu",
+            chat_id="oc_abc",
+            content='<at user_id="ou_bob">牛小数</at> 请看 [文档](https://example.com)',
             metadata={
                 "chat_type": "group",
                 "sender_type": "user",
@@ -430,27 +476,30 @@ async def test_send_uses_native_post_mention_for_group_sender() -> None:
     paragraph = json.loads(sent[0][3])["zh_cn"]["content"][0]
     assert paragraph[0] == {
         "tag": "at",
-        "user_id": "ou_alice",
-        "user_name": "用户",
+        "user_id": "ou_bob",
+        "user_name": "牛小数",
     }
+    # 同一行里的链接不能因为 at 的插入而丢失
+    assert {"tag": "a", "text": "文档", "href": "https://example.com"} in paragraph
+    # 没有任何一段文字残留着原始标签
+    assert all("<at" not in e.get("text", "") for e in paragraph)
 
 
 @pytest.mark.asyncio
-async def test_send_uses_native_card_mention_for_group_sender() -> None:
+async def test_card_normalizes_model_written_mention() -> None:
+    """卡片只认 ``<at id=…></at>``；模型写的 text 语法要改写过去。"""
     channel = _make_feishu_channel(reply_to_message=False)
     sent: list[tuple[str, str, str, str]] = []
 
     with patch.object(
         channel,
         "_send_message_sync",
-        # 真实的 _send_message_sync 成功时返回 message_id；替身也必须返回一个，
-        # 否则会被判成投递失败（list.append 返回 None）。
         side_effect=lambda *args: (sent.append(args), "om_sent")[1],
     ):
         await channel.send(OutboundMessage(
             channel="feishu",
             chat_id="oc_abc",
-            content="@wuw **严重问题**",
+            content='<at user_id="ou_bob">牛小数</at> **严重问题**',
             metadata={
                 "chat_type": "group",
                 "sender_type": "user",
@@ -460,9 +509,9 @@ async def test_send_uses_native_card_mention_for_group_sender() -> None:
 
     assert sent[0][2] == "interactive"
     card = json.loads(sent[0][3])
-    assert card["elements"][0]["content"].startswith(
-        '<at id="ou_alice"></at> **严重问题**'
-    )
+    content = card["elements"][0]["content"]
+    assert content.startswith('<at id="ou_bob"></at> **严重问题**')
+    assert "ou_alice" not in content  # 没有自动补上提问者
 
 
 @pytest.mark.asyncio
@@ -606,7 +655,10 @@ async def test_on_message_prepends_reply_context_when_parent_id_present() -> Non
 
     assert len(captured) == 1
     content = captured[0]["content"]
-    assert content.startswith("[Reply to: original question]")
+    assert content.startswith(
+        "[Feishu private message — speaker: name unresolved (ou_alice); owner: false]"
+    )
+    assert "[Reply to: original question]" in content
     assert "my answer" in content
 
 

@@ -163,5 +163,9 @@ async def test_p2p_messages_are_unaffected() -> None:
 
     # Answered directly, and nothing is buffered for a private chat.
     channel._handle_message.assert_awaited_once()
-    assert channel._handle_message.await_args.kwargs["content"] == "hello"
+    content = channel._handle_message.await_args.kwargs["content"]
+    assert content.startswith(
+        "[Feishu private message — speaker: name unresolved (ou_alice); owner: false]"
+    )
+    assert content.endswith("\nhello")
     assert not channel._group_context

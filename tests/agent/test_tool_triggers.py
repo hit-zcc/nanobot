@@ -220,7 +220,19 @@ def test_shipped_rules_file_still_compiles_and_fires() -> None:
 
     engine = TriggerEngine.load(path)
 
-    assert len(engine.rules) == 8
+    # 断言"规则都装载成功"，不是"永远只有 N 条" —— 写死条数会让每次新增规则
+    # 都变成一次假失败，久而久之只会被改数字糊过去，守卫本身就废了。
+    # 真正要守的是：文件能解析、正则能编译、声明数 == 引擎加载数。
+    declared = sum(
+        1 for line in path.read_text(encoding="utf-8").splitlines()
+        if line.startswith("- id:")
+    )
+    assert declared > 0, "rules file should not be empty"
+    assert len(engine.rules) == declared, (
+        f"declared {declared} rules but engine loaded {len(engine.rules)} — "
+        "通常是某个 pf 块忘了闭合标签，后面的规则被静默吃掉"
+    )
+
     fired = engine.check(
         "exec", {"command": "dcp ddsv deploy create -c prod.x"}, "", session_key="s",
     )

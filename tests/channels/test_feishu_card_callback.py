@@ -247,7 +247,13 @@ async def test_send_records_outbound_message_route() -> None:
 # Mention throttling
 # ---------------------------------------------------------------------------
 
-def test_group_turn_mentions_sender_only_once() -> None:
+def test_channel_never_auto_mentions() -> None:
+    """通道层一律不自动 @ —— @ 谁完全由模型在正文里决定。
+
+    2026-08-20 聪聪：「不要自动艾特，都交给模型来决策」。
+    此前这里会自动 @ 群里的提问者，导致模型定向发给别人时
+    飞书上显示成 @ 了两个人。
+    """
     channel = _channel()
     meta = {
         "chat_type": "group",
@@ -255,8 +261,6 @@ def test_group_turn_mentions_sender_only_once() -> None:
         "message_id": "om_001",
     }
 
-    assert channel._outbound_mention_target(meta) == "ou_alice"
-    # Later messages of the same turn must not re-notify the sender.
     assert channel._outbound_mention_target(meta) is None
-    # A new turn mentions again.
-    assert channel._outbound_mention_target({**meta, "message_id": "om_002"}) == "ou_alice"
+    assert channel._outbound_mention_target({**meta, "message_id": "om_002"}) is None
+    assert channel._outbound_mention_target({}) is None

@@ -101,13 +101,27 @@ def _extract_interactive_content(content: dict) -> list[str]:
         elif isinstance(title, str):
             parts.append(f"title: {title}")
 
-    for elements in content.get("elements", []) if isinstance(content.get("elements"), list) else []:
-        for element in elements:
-            parts.extend(_extract_element_content(element))
+    # elements 在飞书卡片里是**一维**列表 [{...}, {...}]。
+    # 这里以前写成双层循环，等于假设它是二维的：外层把每个 element(dict) 当成
+    # 行、内层遍历 dict 拿到的是键名字符串，_extract_element_content 一律判否返回空
+    # ⇒ 正文恒丢，只剩 title。为兼容极少数嵌套写法，两种形状都收。
+    elements = content.get("elements")
+    if isinstance(elements, list):
+        for item in elements:
+            if isinstance(item, list):  # 嵌套一层的写法
+                for element in item:
+                    parts.extend(_extract_element_content(element))
+            else:
+                parts.extend(_extract_element_content(item))
 
     card = content.get("card", {})
     if card:
         parts.extend(_extract_interactive_content(card))
+
+    # schema 2.0 把正文挪进了 body.elements，此前完全没被读到
+    body = content.get("body", {})
+    if body:
+        parts.extend(_extract_interactive_content(body))
 
     header = content.get("header", {})
     if header:
@@ -181,8 +195,10 @@ def _extract_element_content(element: dict) -> list[str]:
             for ce in col.get("elements", []):
                 parts.extend(_extract_element_content(ce))
 
-    elif tag == "plain_text":
-        content = element.get("content", "")
+    elif tag in ("plain_text", "text"):
+        # "text" 是富文本(post)风格的标签，合并转发里的卡片就用它承载正文
+        # —— 此前没有分支，正文被静默丢弃，只剩同级的 [image]。
+        content = element.get("content", "") or element.get("text", "")
         if content:
             parts.append(content)
 
@@ -301,9 +317,46 @@ def _resolve_text_mentions(
     return text, resolved
 
 
+def _clean_display_name(name: Any) -> str:
+    """Normalize a Feishu display name so it can go into a speaker label.
+
+    Brackets and newlines are stripped so a crafted nickname cannot forge or
+    break out of the ``[Feishu group message …]`` header.
+    """
+    if not isinstance(name, str):
+        return ""
+    cleaned = " ".join(name.replace("[", "(").replace("]", ")").split()).lstrip("@")
+    return cleaned[:64]
+
+
 def _sanitize_unresolved_mentions(text: str) -> str:
     """Prevent internal Feishu mention placeholders from reaching users."""
     return re.sub(r"@_user_\d+\b", "@用户", text)
+
+
+# 同一个 @ 在三种消息类型里写法不同，而模型只会写一种。
+#   text  →  <at user_id="ou_…">名字</at>
+#   card  →  <at id="ou_…"></at>
+#   post  →  {"tag": "at", "user_id": "ou_…"}（见 _markdown_to_post）
+# 写错的那两种不会报错，只会把整个标签**当普通文字显示出来**，
+# 而发送端完全看不出异常（同 `<u>` 那个坑）。所以按目标格式改写一次。
+_ANY_AT_RE = re.compile(
+    r"<at\s+(?:user_)?id=(['\"])(ou_[A-Za-z0-9_-]+|all)\1\s*>(.*?)</at>|"
+    r"<at\s+(?:user_)?id=(['\"])(ou_[A-Za-z0-9_-]+|all)\4\s*/?>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _normalize_mentions(text: str, target: str) -> str:
+    """把正文里模型手写的 ``<at>`` 改写成 ``target`` 格式（text / card）。"""
+    def _sub(m: re.Match) -> str:
+        uid = m.group(2) or m.group(5)
+        label = (m.group(3) or "").strip() or "用户"
+        if target == "card":
+            return f'<at id="{uid}"></at>'
+        return f'<at user_id="{uid}">{html.escape(label, quote=True)}</at>'
+
+    return _ANY_AT_RE.sub(_sub, text)
 
 
 # Colors the card `text_tag`/`number_tag` elements actually accept. The model is
@@ -341,6 +394,10 @@ _ANY_CARD_TAG_RE = re.compile(
     r"</?(?:text_tag|number_tag|font)(?:\s[^>]*)?>", re.IGNORECASE,
 )
 
+# `<u>` 的开闭标签、带属性的开标签、以及自闭合的 `<u/>`。
+# `(?:\s[^>]*)?` 前面必须是空白，所以 `<ul>` / `<underline>` 不会被误伤。
+_UNDERLINE_TAG_RE = re.compile(r"</?u(?:\s[^>]*)?/?>", re.IGNORECASE)
+
 
 def _sanitize_font_tags(text: str) -> str:
     """Rewrite `<font color=...>` into `<text_tag>`, or drop the tag if the color isn't one text_tag knows."""
@@ -377,8 +434,25 @@ def _sanitize_number_tags(text: str) -> str:
     return _NUMBER_TAG_RE.sub(_replace, text)
 
 
+def _sanitize_underline_tags(text: str) -> str:
+    """剥掉 ``<u>`` 标签、保留里面的文字。
+
+    飞书**不渲染下划线标签**：``<u>要点</u>`` 会被原样当普通文字显示，
+    用户看到的是一串带尖括号的标签。而发送端 API 照常返回成功，
+    所以发送方（模型）对这次污染零感知，只会一犯再犯。人格档案里
+    已经写了"不要用 ``<u>``"，2026-08-19 / 08-20 仍连着犯了两轮 ——
+    靠"记得别写"是无效的，只能在出站链路上拦一道。
+    """
+    return _UNDERLINE_TAG_RE.sub("", text)
+
+
 def _sanitize_card_markup(text: str) -> str:
     """Rewrite/strip the markup the model most often gets wrong before it reaches the card API."""
+    # 卡片只认 ``<at id=…></at>``。模型多半写的是 text 消息那套 ``user_id=`` +
+    # 显示名，卡片会把它当普通文字**原样显示**，而发送端毫无异常。
+    # 流式路径也走这里，所以增量卡片一并覆盖。
+    text = _normalize_mentions(text, "card")
+    text = _sanitize_underline_tags(text)
     return _sanitize_number_tags(_sanitize_tag_colors(_sanitize_font_tags(text)))
 
 
@@ -574,6 +648,10 @@ class FeishuChannel(BaseChannel):
         # that produced the card.  Keyed by bot message_id and by open_chat_id.
         self._outbound_routes: OrderedDict[str, str] = OrderedDict()
         self._chat_routes: OrderedDict[str, str] = OrderedDict()
+        # 收到的每条消息属于哪个会话（群 oc_… 或 p2p 对方 ou_…）。
+        # reply 接口按父消息所在会话投递、忽略 receive_id，所以回复前必须
+        # 确认父消息和本次目标是同一个会话，否则消息会静静落到别处。
+        self._inbound_chats: OrderedDict[str, str] = OrderedDict()
         # Inbound message ids whose reply already carried an @mention, so a turn
         # that spans several outbound messages only notifies the sender once.
         self._mentioned_turns: OrderedDict[str, None] = OrderedDict()
@@ -581,6 +659,11 @@ class FeishuChannel(BaseChannel):
         # not answered, but the next mention hands them over as context — people
         # routinely post the question first and @ the bot in a follow-up message.
         self._group_context: dict[str, deque[tuple[str, int, str]]] = {}
+        # open_id → 显示名。群聊里模型必须知道"这句话是谁说的"，否则会把
+        # 同事的话当成 owner 的授权。名字优先从消息自带的 mentions 里白捡，
+        # miss 时才去查通讯录 API，查不到的也记下来避免反复请求。
+        self._user_names: OrderedDict[str, str] = OrderedDict()
+        self._user_name_misses: OrderedDict[str, None] = OrderedDict()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
         self._tool_progress_messages: dict[str, str] = {}
@@ -804,6 +887,128 @@ class FeishuChannel(BaseChannel):
             return True
         return self._is_bot_mentioned(message)
 
+    # ---- speaker identity ------------------------------------------------
+    # 所有真人消息进模型前都必须带上发言人。会话按 open_id 隔离，不等于模型
+    # 知道对方是谁；私聊缺身份时，全局 USER.md 会让模型把任何人都当成 owner。
+
+    # owner 是安全边界而不是显示偏好：只有这个已核实的主会话 open_id 才能继承
+    # USER.md 中「称呼聪聪」等 owner 专属上下文，不能由昵称或通讯录返回值推断。
+    _OWNER_OPEN_ID = "ou_d2f54e2fef912bbda0dc78379fff260b"
+    # 通讯录 API 常因缺 contact:user.base:readonly 权限失败。这里只保留已从本地
+    # 联系人档案和真实消息日志交叉核实的最小兜底，不让 channel 依赖整份 MEMORY。
+    _LOCAL_IDENTITIES = {
+        _OWNER_OPEN_ID: "聪聪",
+        "ou_d65881388399920703ccf0787d515a6a": "杨溥（溥神）",
+    }
+    _USER_NAME_CACHE_MAX = 500
+
+    def _cache_user_name(self, open_id: str, name: str) -> None:
+        """Remember *open_id* → display name, bounded LRU-style."""
+        safe_name = _clean_display_name(name)
+        if not open_id or not safe_name:
+            return
+        self._user_names[open_id] = safe_name
+        self._user_names.move_to_end(open_id)
+        while len(self._user_names) > self._USER_NAME_CACHE_MAX:
+            self._user_names.popitem(last=False)
+        self._user_name_misses.pop(open_id, None)
+
+    def _learn_names_from_mentions(self, message: Any) -> None:
+        """Harvest display names from the message's ``mentions`` (zero cost)."""
+        for mention in getattr(message, "mentions", None) or []:
+            mention_id = getattr(mention, "id", None)
+            open_id = getattr(mention_id, "open_id", None)
+            if not isinstance(open_id, str) or not open_id.startswith("ou_"):
+                continue
+            name = _clean_display_name(getattr(mention, "name", None))
+            if name:
+                self._cache_user_name(open_id, name)
+
+    @staticmethod
+    def _fallback_user_label(open_id: str) -> str:
+        """Label used when the display name cannot be resolved."""
+        return f"unknown-user({open_id or 'unknown'})"
+
+    def _fetch_user_name_sync(self, open_id: str) -> str:
+        """Look up a display name via contact v3 (blocking). ``""`` on failure.
+
+        Requires the ``contact:user.base:readonly`` scope; without it the call
+        just fails and we degrade to the open_id label.
+        """
+        if not self._client:
+            return ""
+        try:
+            from lark_oapi.api.contact.v3 import GetUserRequest
+
+            request = GetUserRequest.builder() \
+                .user_id(open_id) \
+                .user_id_type("open_id") \
+                .build()
+            response = self._client.contact.v3.user.get(request)
+            if not response.success():
+                logger.debug(
+                    "Feishu: contact lookup failed for {}: code={}, msg={}",
+                    open_id, getattr(response, "code", "?"), getattr(response, "msg", "?"),
+                )
+                return ""
+            user = getattr(getattr(response, "data", None), "user", None)
+            return _clean_display_name(getattr(user, "name", None))
+        except Exception as e:  # noqa: BLE001 - identity lookup must never break messaging
+            logger.debug("Feishu: contact lookup error for {}: {}", open_id, e)
+            return ""
+
+    async def _resolve_user_name(self, open_id: str) -> str:
+        """Best-effort ``open_id`` → display name.  Never raises."""
+        if not isinstance(open_id, str) or not open_id.startswith("ou_"):
+            return self._fallback_user_label(str(open_id or ""))
+        cached = self._user_names.get(open_id)
+        if cached:
+            self._user_names.move_to_end(open_id)
+            return cached
+        if self._client and open_id not in self._user_name_misses:
+            try:
+                loop = asyncio.get_running_loop()
+                name = await loop.run_in_executor(None, self._fetch_user_name_sync, open_id)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Feishu: name resolution failed for {}: {}", open_id, e)
+                name = ""
+            if name:
+                self._cache_user_name(open_id, name)
+                return name
+            # Negative cache so one missing scope does not mean one API call
+            # per message forever.
+            self._user_name_misses[open_id] = None
+            while len(self._user_name_misses) > self._USER_NAME_CACHE_MAX:
+                self._user_name_misses.popitem(last=False)
+        # Contact API 失败后才走本地最小映射；陌生人必须保持 unresolved，不能
+        # 因为 USER.md 写了 owner 姓名就猜成 owner。
+        local_name = self._LOCAL_IDENTITIES.get(open_id, "")
+        if local_name:
+            self._cache_user_name(open_id, local_name)
+            return local_name
+        return self._fallback_user_label(open_id)
+
+    @staticmethod
+    def _format_speaker_header(name: str, open_id: str) -> str:
+        """Header that tells the model exactly who is speaking in a group."""
+        safe = _clean_display_name(name) or "unknown"
+        if safe == FeishuChannel._fallback_user_label(open_id):
+            # 名字没解析出来时不要把 open_id 打印两遍
+            safe = "name unresolved"
+        return f"[Feishu group message — speaker: {safe} ({open_id})]"
+
+    @classmethod
+    def _format_private_speaker_header(cls, name: str, open_id: str) -> str:
+        """Identity boundary for p2p turns; explicitly overrides owner assumptions."""
+        safe = _clean_display_name(name) or "unknown"
+        if safe == cls._fallback_user_label(open_id):
+            safe = "name unresolved"
+        owner = open_id == cls._OWNER_OPEN_ID
+        return (
+            f"[Feishu private message — speaker: {safe} ({open_id}); "
+            f"owner: {str(owner).lower()}]"
+        )
+
     def _buffer_group_context(self, message: Any, sender_id: str) -> None:
         """Remember an un-addressed group message as context for the next mention.
 
@@ -847,14 +1052,19 @@ class FeishuChannel(BaseChannel):
         created_ms = int(getattr(message, "create_time", 0) or 0)
         buf.append((sender_id, created_ms, text))
 
-    def _drain_group_context(self, chat_id: str, current_sender: str) -> str:
-        """Render and clear the buffered group messages for *chat_id*."""
+    async def _drain_group_context(self, chat_id: str, current_sender: str) -> str:
+        """Render and clear the buffered group messages for *chat_id*.
+
+        Senders are rendered by display name — a bare ``ou_…`` tells the model
+        nothing about who said what.
+        """
         buf = self._group_context.pop(chat_id, None)
         if not buf:
             return ""
         lines = []
         for sender_id, created_ms, text in buf:
-            who = "same sender" if sender_id == current_sender else sender_id
+            label = await self._resolve_user_name(sender_id)
+            who = f"{label} (same sender)" if sender_id == current_sender else label
             when = (
                 time.strftime("%H:%M", time.localtime(created_ms / 1000))
                 if created_ms else "?"
@@ -1049,6 +1259,14 @@ class FeishuChannel(BaseChannel):
 
     # Markdown link: [text](url)
     _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\)]+)\)")
+    # 模型手写的 @：``<at user_id="ou_…">名字</at>``（也认 ``id=``、自闭合）。
+    # text 消息和卡片都原生认这个写法，只有 post 需要转成 ``at`` 元素，
+    # 否则整段标签会被当成普通文字**原样显示出来**（同 ``<u>`` 的坑）。
+    _AT_TAG_RE = re.compile(
+        r"<at\s+(?:user_)?id=(['\"])(ou_[A-Za-z0-9_-]+|all)\1\s*>(.*?)</at>|"
+        r"<at\s+(?:user_)?id=(['\"])(ou_[A-Za-z0-9_-]+|all)\4\s*/?>",
+        re.IGNORECASE | re.DOTALL,
+    )
 
     # Unordered list items
     _LIST_RE = re.compile(r"^[\s]*[-*+]\s+", re.MULTILINE)
@@ -1101,32 +1319,20 @@ class FeishuChannel(BaseChannel):
         return "post"
 
     def _outbound_mention_target(self, metadata: dict[str, Any] | None) -> str | None:
-        """Return the real Feishu open_id to mention for a group reply.
+        """群回复要不要 @ 人，由模型自己决定 —— 通道层一律不自动加。
 
-        Only the *first* outbound message of a turn mentions the sender.  A turn
-        often spans several messages (media, chunked cards, follow-up sends), and
-        repeating the ``<at>`` re-notifies the group for what is one reply.
+        2026-08-20 聪聪当场要求：「不要自动艾特，都交给模型来决策」。
+        原来这里会在群聊回复时自动 @ 提问者，于是模型明明是定向发给
+        牛小数（正文里已写 ``<at>``），飞书上却显示成 @ 了两个人。
+
+        自动 @ 的问题不只是多余：它让「@ 谁」这件事**脱离了模型的意图**，
+        而模型才是唯一知道这句话说给谁听的一方。想 @ 人就在正文里直接写
+        ``<at user_id="ou_…">名字</at>``（实测 text 消息生效）。
+
+        入站侧的 ``_reply_targets`` 仍然保留 —— 它是"谁在群里叫了我"的
+        记录，模型需要拿它来决定 @ 谁，跟自动追加是两回事。
         """
-        meta = metadata or {}
-        if meta.get("_progress") or meta.get("_tool_hint"):
-            return None
-        if meta.get("sender_type") == "bot":
-            return None
-
-        target = ""
-        if meta.get("chat_type") == "group":
-            target = str(meta.get("sender_open_id") or "")
-        if not target and meta.get("message_id"):
-            target = self._reply_targets.get(str(meta["message_id"]), "")
-        if not re.fullmatch(r"ou_[A-Za-z0-9_-]+", target):
-            return None
-
-        turn_key = str(meta.get("message_id") or "")
-        if turn_key:
-            if turn_key in self._mentioned_turns:
-                return None
-            self._remember(self._mentioned_turns, turn_key, None)
-        return target
+        return None
 
     @classmethod
     def _markdown_to_post(
@@ -1148,16 +1354,33 @@ class FeishuChannel(BaseChannel):
             elements: list[dict] = []
             last_end = 0
 
-            for m in cls._MD_LINK_RE.finditer(line):
+            # 链接和 @ 混在一行里，按出现顺序扫，不能先扫完一种再扫另一种。
+            inline = sorted(
+                [(m, "link") for m in cls._MD_LINK_RE.finditer(line)]
+                + [(m, "at") for m in cls._AT_TAG_RE.finditer(line)],
+                key=lambda pair: pair[0].start(),
+            )
+            for m, kind in inline:
+                if m.start() < last_end:  # 与前一个匹配重叠，跳过
+                    continue
                 # Text before this link
                 before = line[last_end:m.start()]
                 if before:
                     elements.append({"tag": "text", "text": before})
-                elements.append({
-                    "tag": "a",
-                    "text": m.group(1),
-                    "href": m.group(2),
-                })
+                if kind == "link":
+                    elements.append({
+                        "tag": "a",
+                        "text": m.group(1),
+                        "href": m.group(2),
+                    })
+                else:
+                    uid = m.group(2) or m.group(5)
+                    label = (m.group(3) or "").strip()
+                    elements.append({
+                        "tag": "at",
+                        "user_id": uid,
+                        "user_name": label or "用户",
+                    })
                 last_end = m.end()
 
             # Remaining text after last link
@@ -1366,6 +1589,160 @@ class FeishuChannel(BaseChannel):
         except Exception as e:
             logger.debug("Feishu: error fetching chat {}: {}", chat_id, e)
             return None
+
+    # 合并转发展开的护栏：套娃可以很深，也可以很宽。这两个数是"够用就好"，
+    # 真正的目的是防止一条恶意/异常消息把入站链路拖死。
+    _MERGE_FORWARD_MAX_DEPTH = 5
+    _MERGE_FORWARD_MAX_ITEMS = 60
+    # 卡片回查每张一次 API，长转发里可能有几十张 —— 给个闸，别把入站拖死
+    _MERGE_FORWARD_MAX_REFETCH = 20
+
+    def _expand_merge_forward_sync(self, message_id: str) -> str | None:
+        """展开合并转发消息，返回缩进的树状文本。
+
+        飞书把子消息**直接放在** `im/v1/messages/{id}` 的 items 里，靠
+        `upper_message_id` 指回父节点串成树 —— 不需要额外接口。
+        我此前三次(08-09/08-17/08-21)都跟聪聪说"内容没透传过来"，那是读码
+        推断从没验证过；实测一个普通 GET 就能拿全。见铁律 A㉓。
+
+        ⚠️ 嵌套的 interactive 卡片，飞书服务端只下发
+        「请升级至最新版本客户端，以查看内容」占位 —— 那部分确实取不到，
+        与本函数无关，不要再把它误报成"解析失败"。
+        """
+        from lark_oapi.api.im.v1 import GetMessageRequest
+        try:
+            request = GetMessageRequest.builder().message_id(message_id).build()
+            response = self._client.im.v1.message.get(request)
+            if not response.success():
+                logger.debug(
+                    "Feishu: could not expand merge_forward {}: code={}, msg={}",
+                    message_id, response.code, response.msg,
+                )
+                return None
+
+            items = getattr(response.data, "items", None) or []
+            if len(items) <= 1:
+                # 只有外层自己，没有子消息可展开
+                return None
+
+            children: dict[str, list[Any]] = {}
+            for it in items:
+                mid = getattr(it, "message_id", "")
+                if mid == message_id:
+                    continue  # 根节点自己不进树
+                parent = getattr(it, "upper_message_id", "") or message_id
+                children.setdefault(parent, []).append(it)
+
+            lines: list[str] = []
+            rendered = 0
+            refetched = 0
+
+            def walk(parent_id: str, depth: int) -> None:
+                nonlocal rendered, refetched
+                if depth > self._MERGE_FORWARD_MAX_DEPTH:
+                    lines.append("  " * depth + "… (更深的嵌套已省略)")
+                    return
+                for child in children.get(parent_id, []):
+                    if rendered >= self._MERGE_FORWARD_MAX_ITEMS:
+                        lines.append("  " * depth + "… (更多消息已省略)")
+                        return
+                    rendered += 1
+                    indent = "  " * depth
+                    sub_type = getattr(child, "msg_type", "") or "unknown"
+                    sender = self._merge_forward_sender_label(child)
+
+                    if sub_type == "merge_forward":
+                        lines.append(f"{indent}{sender}[合并转发]")
+                        walk(getattr(child, "message_id", ""), depth + 1)
+                        continue
+
+                    allow = refetched < self._MERGE_FORWARD_MAX_REFETCH
+                    if sub_type == "interactive" and allow:
+                        refetched += 1
+                    text = self._render_merge_forward_leaf(child, sub_type, allow)
+                    for i, line in enumerate(text.splitlines() or [""]):
+                        lines.append(f"{indent}{sender if i == 0 else ''}{line}")
+
+            walk(message_id, 0)
+            if not lines:
+                return None
+            return "[合并转发的聊天记录]\n" + "\n".join(lines)
+        except Exception as e:
+            logger.debug("Feishu: error expanding merge_forward {}: {}", message_id, e)
+            return None
+
+    @staticmethod
+    def _merge_forward_sender_label(msg_obj: Any) -> str:
+        """子消息的发送者前缀，取不到就返回空串（不编造）。"""
+        sender = getattr(msg_obj, "sender", None)
+        sid = getattr(sender, "id", "") if sender else ""
+        return f"{sid}: " if sid else ""
+
+    def _refetch_card_body_sync(self, message_id: str) -> str | None:
+        """按 message_id 单独拉一条卡片消息的 body.content。
+
+        为什么需要这一步：合并转发的 items 里，interactive 子消息的 body 被飞书
+        降级成 `{"elements":[[{"tag":"img"},{"tag":"text","text":"请升级至最新版本客户端…"}]]}`，
+        而**用同一条子消息的 message_id 单独 GET，拿到的是完整卡片正文**。
+        降级只发生在"作为父消息的附属项返回"时，不是平台不给。
+
+        我此前说过"API 侧就只给这句" —— 那是拿一个接口的单次观察当成了平台的
+        全部行为，第 4 次栽在同一形状上（铁律 A㉓）。
+        """
+        from lark_oapi.api.im.v1 import GetMessageRequest
+        try:
+            request = GetMessageRequest.builder().message_id(message_id).build()
+            response = self._client.im.v1.message.get(request)
+            if not response.success():
+                return None
+            items = getattr(response.data, "items", None) or []
+            for it in items:
+                if getattr(it, "message_id", "") != message_id:
+                    continue
+                body = getattr(it, "body", None)
+                return getattr(body, "content", None) if body else None
+            return None
+        except Exception as e:
+            logger.debug("Feishu: error refetching card {}: {}", message_id, e)
+            return None
+
+    def _render_merge_forward_leaf(
+        self, msg_obj: Any, msg_type: str, allow_refetch: bool = True,
+    ) -> str:
+        """把一条非 merge_forward 的子消息渲染成一行文本。"""
+        raw = getattr(msg_obj, "body", None)
+        raw = getattr(raw, "content", None) if raw else None
+
+        # 卡片一律回查，不去猜"这个 body 是不是降级过的"。
+        # 试过按文案匹配「请升级至最新版本客户端」——飞书改一次文案就失效；
+        # 也试过按"解析结果为空"判断——可我刚补的 tag:"text" 分支恰好能把
+        # 降级占位解析成一句正常文字，判据当场失效。脆弱的判据不如不要。
+        if msg_type == "interactive" and allow_refetch:
+            mid = getattr(msg_obj, "message_id", "")
+            if mid and self._client:
+                full = self._refetch_card_body_sync(mid)
+                if full:
+                    raw = full
+
+        if not raw:
+            return f"[{msg_type}]"
+        try:
+            content_json = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return raw.strip() or f"[{msg_type}]"
+
+        if msg_type == "text":
+            text, _ = _resolve_text_mentions(
+                content_json.get("text", ""), getattr(msg_obj, "mentions", None)
+            )
+            return text.strip() or "[text]"
+        if msg_type == "post":
+            text, _ = _extract_post_content(content_json)
+            return text.strip() or "[post]"
+        if msg_type in ("share_chat", "share_user", "interactive",
+                        "share_calendar_event", "system"):
+            return _extract_share_card_content(content_json, msg_type)
+        return MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
 
     def _get_message_content_sync(self, message_id: str) -> str | None:
         """Fetch the text content of a Feishu message by ID (synchronous).
@@ -2005,6 +2382,13 @@ class FeishuChannel(BaseChannel):
                 logger.warning("Feishu: sanitized unresolved mention placeholder in outbound message")
                 msg.content = sanitized_content
 
+            # `<u>` 在 text / post 消息里同样不渲染，而这两条路不经过
+            # ``_sanitize_card_markup``。在这里剥一次，三种消息类型都覆盖到。
+            unlined = _sanitize_underline_tags(msg.content)
+            if unlined != msg.content:
+                logger.warning("Feishu: stripped <u> tags from outbound message (Feishu won't render them)")
+                msg.content = unlined
+
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
 
@@ -2034,6 +2418,20 @@ class FeishuChannel(BaseChannel):
             # For topic group messages, always reply to keep context in thread
             elif msg.metadata.get("thread_id"):
                 reply_message_id = msg.metadata.get("root_id") or msg.metadata.get("message_id") or None
+
+            # 🔴 reply 按 **父消息所在会话** 投递，receive_id 完全不看。
+            # 父消息若来自别的会话，回复就会落到那边，而 API 依然返回成功。
+            # 2026-08-19 实测：指定 test 群发附件，文件进了 p2p 私聊，
+            # 后发的文字走 create 正常到群里 —— 于是表现成"附件不见了"。
+            if reply_message_id:
+                origin = self._inbound_chats.get(reply_message_id)
+                if origin and origin != msg.chat_id:
+                    logger.warning(
+                        "Feishu: parent message {} belongs to {}, not {}; "
+                        "sending without reply to avoid cross-chat delivery",
+                        reply_message_id, origin, msg.chat_id,
+                    )
+                    reply_message_id = None
 
             first_send = True  # tracks whether the reply has already been used
 
@@ -2109,6 +2507,7 @@ class FeishuChannel(BaseChannel):
                             f'<at user_id="{mention_target}">{label}</at> '
                             f"{content}"
                         )
+                    content = _normalize_mentions(content, "text")
                     text_body = json.dumps({"text": content.strip()}, ensure_ascii=False)
                     await loop.run_in_executor(None, _do_send, "text", text_body)
 
@@ -2125,6 +2524,8 @@ class FeishuChannel(BaseChannel):
                     # Complex / long content – send as interactive card
                     if mention_target:
                         content = f'<at id="{mention_target}"></at> {content}'
+                    # at 的规范化在 _build_card_elements → _sanitize_card_markup 里做，
+                    # 这样流式卡片走同一条路，不用两处各写一遍。
                     elements = self._build_card_elements(content)
                     for chunk in self._split_elements_by_table_limit(elements):
                         card = {"config": {"wide_screen_mode": True}, "elements": chunk}
@@ -2348,6 +2749,9 @@ class FeishuChannel(BaseChannel):
             msg_type = message.message_type
             sender_type = sender.sender_type
 
+            # Free display names: whoever got @mentioned carries their name.
+            self._learn_names_from_mentions(message)
+
             if sender_type == "bot":
                 # Feishu only delivers these with
                 # im:message.group_at_msg.include_bot:readonly. Keep an explicit
@@ -2411,8 +2815,15 @@ class FeishuChannel(BaseChannel):
                 content_parts.append(content_text)
 
             elif msg_type in ("share_chat", "share_user", "interactive", "share_calendar_event", "system", "merge_forward"):
-                # Handle share cards and interactive messages
-                text = _extract_share_card_content(content_json, msg_type)
+                text = ""
+                if msg_type == "merge_forward" and message_id and self._client:
+                    # 子消息就在同一个 GET 的 items 里，展开它；失败再退回占位符
+                    loop = asyncio.get_running_loop()
+                    text = await loop.run_in_executor(
+                        None, self._expand_merge_forward_sync, message_id
+                    ) or ""
+                if not text:
+                    text = _extract_share_card_content(content_json, msg_type)
                 if text:
                     content_parts.append(text)
 
@@ -2439,14 +2850,28 @@ class FeishuChannel(BaseChannel):
                 return
             if sender_type == "bot":
                 content = (
-                    "[Message from another Feishu bot; explicitly addressed to this bot]\n"
+                    f"[Message from another Feishu bot ({sender_id}); "
+                    "explicitly addressed to this bot]\n"
                     + content
                 )
+
+            # 模型只读 content，session 隔离本身不会告诉它对方是谁。群聊写明
+            # speaker；私聊还要写死 owner 判定，覆盖 USER.md 中仅适用于聪聪的称呼。
+            # Bot sender 已有专用 header，且只允许「群聊 + 明确 @bot」，不重复标记。
+            if sender_type != "bot":
+                speaker_name = await self._resolve_user_name(sender_id)
+                if chat_type == "group":
+                    identity_header = self._format_speaker_header(speaker_name, sender_id)
+                else:
+                    identity_header = self._format_private_speaker_header(
+                        speaker_name, sender_id
+                    )
+                content = f"{identity_header}\n{content}"
 
             # Hand over anything said in this group since the bot was last
             # addressed, so a bare "@bot" still carries what it refers to.
             if chat_type == "group":
-                if group_context := self._drain_group_context(chat_id, sender_id):
+                if group_context := await self._drain_group_context(chat_id, sender_id):
                     content = f"{group_context}\n\n{content}" if content else group_context
 
             # Forward to message bus
@@ -2455,6 +2880,8 @@ class FeishuChannel(BaseChannel):
             # to a session so the callback routes back to the same session.
             if chat_id:
                 self._remember(self._chat_routes, chat_id, reply_to)
+            if message_id:
+                self._remember(self._inbound_chats, message_id, reply_to)
             if chat_type == "group" and sender_type != "bot" and sender_id.startswith("ou_"):
                 self._remember(self._reply_targets, message_id, sender_id)
             await self._handle_message(

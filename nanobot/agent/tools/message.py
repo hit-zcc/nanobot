@@ -90,8 +90,17 @@ class MessageTool(Tool):
         **kwargs: Any
     ) -> str:
         channel = channel or self._default_channel
+        explicit_chat = bool(chat_id) and chat_id != self._default_chat_id
         chat_id = chat_id or self._default_chat_id
         message_id = message_id or self._default_message_id
+
+        # 🔴 显式指定了别的 chat_id，就不能再沿用当前会话的 message_id。
+        # 飞书 reply 接口按 **父消息所在会话** 投递，chat_id 被完全忽略：
+        # 2026-08-19 实测，指定群 oc_6b68…（test 群）发附件，文件却落进了
+        # 与父消息同源的 p2p 私聊 oc_a276…，而 API 全程返回成功。
+        # 表现就是"文字看得到、附件不见了"——因为文字是后发的、走的 create。
+        if explicit_chat:
+            message_id = None
 
         if not channel or not chat_id:
             return "Error: No target channel/chat specified"

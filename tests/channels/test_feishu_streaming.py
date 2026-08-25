@@ -161,7 +161,8 @@ class TestSendDelta:
         ch._client.cardkit.v1.card_element.content.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_first_delta_uses_native_card_mention_for_group_sender(self):
+    async def test_first_delta_does_not_auto_mention(self):
+        """流式卡片同样不再自动 @ 提问者（2026-08-20 聪聪要求）。"""
         ch = _make_channel()
         ch._reply_targets["om_user"] = "ou_alice"
         ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_new")
@@ -170,16 +171,18 @@ class TestSendDelta:
 
         await ch.send_delta(
             "oc_chat1",
-            "@wuw 查清楚了",
+            "查清楚了",
             metadata={"message_id": "om_user"},
         )
 
-        assert ch._stream_bufs["oc_chat1"].text == (
-            '<at id="ou_alice"></at> 查清楚了'
-        )
+        buf = ch._stream_bufs["oc_chat1"]
+        assert buf.text == "查清楚了"
+        assert buf.mention_target is None
+        assert buf.mention_pending is False
 
     @pytest.mark.asyncio
-    async def test_native_mention_waits_for_split_display_name(self):
+    async def test_streaming_does_not_hold_back_on_leading_at(self):
+        """开头是 ``@`` 时不再等"显示名收全"——没有要剥的东西了，直接开卡。"""
         ch = _make_channel()
         ch._reply_targets["om_user"] = "ou_alice"
         ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_new")
@@ -191,19 +194,13 @@ class TestSendDelta:
             "@w",
             metadata={"message_id": "om_user"},
         )
-
-        assert ch._stream_bufs["oc_chat1"].text == "@w"
-        ch._client.cardkit.v1.card.create.assert_not_called()
-
         await ch.send_delta(
             "oc_chat1",
             "uw Prompt 侧单独改以下 4 项即可",
             metadata={"message_id": "om_user"},
         )
 
-        assert ch._stream_bufs["oc_chat1"].text == (
-            '<at id="ou_alice"></at> Prompt 侧单独改以下 4 项即可'
-        )
+        assert ch._stream_bufs["oc_chat1"].text == "@wuw Prompt 侧单独改以下 4 项即可"
         ch._client.cardkit.v1.card.create.assert_called_once()
 
     @pytest.mark.asyncio
