@@ -50,6 +50,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+claude-agent-sdk = [
+    "claude-agent-sdk>=0.2.149,<0.3.0",
+]
 wecom = [
     "wecom-aibot-sdk-python>=0.1.5",
 ]

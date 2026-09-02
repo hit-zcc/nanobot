@@ -181,10 +181,10 @@ class TestSendDelta:
         assert buf.mention_pending is False
 
     @pytest.mark.asyncio
-    async def test_streaming_does_not_hold_back_on_leading_at(self):
-        """开头是 ``@`` 时不再等"显示名收全"——没有要剥的东西了，直接开卡。"""
+    async def test_streaming_upgrades_known_leading_at_after_name_is_complete(self):
+        """分片的 ``@name`` 收全后必须带 cached open_id 再开卡。"""
         ch = _make_channel()
-        ch._reply_targets["om_user"] = "ou_alice"
+        ch._cache_user_name("ou_wuw", "wuw")
         ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_new")
         ch._client.im.v1.message.create.return_value = _mock_send_response("om_new")
         ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
@@ -194,13 +194,29 @@ class TestSendDelta:
             "@w",
             metadata={"message_id": "om_user"},
         )
+        ch._client.cardkit.v1.card.create.assert_not_called()
         await ch.send_delta(
             "oc_chat1",
             "uw Prompt 侧单独改以下 4 项即可",
             metadata={"message_id": "om_user"},
         )
 
-        assert ch._stream_bufs["oc_chat1"].text == "@wuw Prompt 侧单独改以下 4 项即可"
+        assert ch._stream_bufs["oc_chat1"].text == (
+            '<at id="ou_wuw"></at> Prompt 侧单独改以下 4 项即可'
+        )
+        ch._client.cardkit.v1.card.create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_streaming_drops_fake_at_without_open_id(self):
+        """未知显示名不能以一个无效的纯文本 ``@`` 发出去。"""
+        ch = _make_channel()
+        ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_new")
+        ch._client.im.v1.message.create.return_value = _mock_send_response("om_new")
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        await ch.send_delta("oc_chat1", "@陌生机器人 请看")
+
+        assert ch._stream_bufs["oc_chat1"].text == "陌生机器人 请看"
         ch._client.cardkit.v1.card.create.assert_called_once()
 
     @pytest.mark.asyncio

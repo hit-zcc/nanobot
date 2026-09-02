@@ -597,33 +597,56 @@ class FeishuChannel(BaseChannel):
         r"^\s*@([^\s,，:：]+)[\s,，:：]+"
     )
 
-    @classmethod
     def _finalize_stream_mention(
-        cls,
+        self,
         buf: _FeishuStreamBuf,
         *,
         force: bool = False,
     ) -> bool:
-        """Wait for a complete streamed ``@name`` token before removing it."""
-        if not buf.mention_pending or not buf.mention_target:
-            return True
+        """Make a leading streamed ``@name`` a native mention or plain text."""
 
         stripped = buf.text.lstrip()
         if not stripped:
             return False
+        if buf.mention_pending and buf.mention_target:
+            if stripped.startswith("@"):
+                match = self._STREAM_LEADING_MENTION_RE.match(buf.text)
+                if not match and not force:
+                    return False
+                if match:
+                    remainder = buf.text[match.end():].lstrip()
+                else:
+                    _, remainder = _split_leading_display_mention(buf.text)
+            else:
+                remainder = stripped
+
+            buf.text = f'<at id="{buf.mention_target}"></at> {remainder}'
+            buf.mention_pending = False
+            return True
+
+        # The model explicitly chose a target with ``@name``. Streaming can
+        # split that token across deltas, so hold the card until a delimiter
+        # proves the display name is complete, then attach its cached open_id.
         if stripped.startswith("@"):
-            match = cls._STREAM_LEADING_MENTION_RE.match(buf.text)
+            match = self._STREAM_LEADING_MENTION_RE.match(buf.text)
             if not match and not force:
                 return False
             if match:
+                name = match.group(1)
                 remainder = buf.text[match.end():].lstrip()
             else:
-                _, remainder = _split_leading_display_mention(buf.text)
-        else:
-            remainder = stripped
-
-        buf.text = f'<at id="{buf.mention_target}"></at> {remainder}'
-        buf.mention_pending = False
+                name, remainder = _split_leading_display_mention(buf.text)
+            open_id = self._open_id_for_display_name(name)
+            if open_id:
+                logger.debug("Feishu: upgraded streamed leading @{} to a native mention", name)
+                buf.text = f'<at id="{open_id}"></at> {remainder}'.rstrip()
+            else:
+                logger.warning(
+                    "Feishu: streamed leading @{} has no unique cached open_id; "
+                    "sending it as plain text",
+                    name,
+                )
+                buf.text = f"{name} {remainder}".rstrip()
         return True
 
     @classmethod
@@ -899,6 +922,10 @@ class FeishuChannel(BaseChannel):
     _LOCAL_IDENTITIES = {
         _OWNER_OPEN_ID: "聪聪",
         "ou_d65881388399920703ccf0787d515a6a": "杨溥（溥神）",
+        # Verified from a real bot-authored group event on 2026-08-31. Keeping
+        # this here makes ``@豆包`` resolvable immediately after a restart,
+        # before the in-memory mention cache has been warmed again.
+        "ou_66244dbc857794ee92956876ab0f022b": "豆包",
     }
     _USER_NAME_CACHE_MAX = 500
 
@@ -1333,6 +1360,40 @@ class FeishuChannel(BaseChannel):
         记录，模型需要拿它来决定 @ 谁，跟自动追加是两回事。
         """
         return None
+
+    def _open_id_for_display_name(self, name: str) -> str | None:
+        """Return a unique cached open_id for a Feishu display name."""
+        clean_name = _clean_display_name(name)
+        known_names = {**self._LOCAL_IDENTITIES, **self._user_names}
+        matches = [
+            open_id
+            for open_id, cached_name in known_names.items()
+            if cached_name == clean_name and open_id.startswith("ou_")
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def _upgrade_leading_display_mention(self, content: str) -> str:
+        """Turn a model-written leading ``@name`` into a real Feishu mention.
+
+        The channel deliberately does not auto-mention the sender. This only
+        preserves an explicit target chosen by the model. If that target cannot
+        be resolved uniquely, remove the misleading ``@`` rather than sending
+        something that looks like a notification but is only plain text.
+        """
+        match = _LEADING_DISPLAY_MENTION_RE.match(content)
+        if not match:
+            return content
+        name = match.group(1)
+        remainder = content[match.end():].lstrip()
+        open_id = self._open_id_for_display_name(name)
+        if not open_id:
+            logger.warning(
+                "Feishu: leading @{} has no unique cached open_id; sending it as plain text",
+                name,
+            )
+            return f"{name} {remainder}".rstrip()
+        logger.debug("Feishu: upgraded leading @{} to a native mention", name)
+        return f'<at user_id="{open_id}">{html.escape(name, quote=True)}</at> {remainder}'.rstrip()
 
     @classmethod
     def _markdown_to_post(
@@ -2489,6 +2550,7 @@ class FeishuChannel(BaseChannel):
                         )
 
             if msg.content and msg.content.strip():
+                msg.content = self._upgrade_leading_display_mention(msg.content)
                 fmt = self._detect_msg_format(msg.content)
                 mention_target = self._outbound_mention_target(msg.metadata)
                 mention_label = "用户"
@@ -2830,6 +2892,12 @@ class FeishuChannel(BaseChannel):
             else:
                 content_parts.append(MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]"))
 
+            # What the user actually typed, before the quoted-reply,
+            # identity and group-context prefixes are layered on below.
+            # Slash commands match against this: the model needs the
+            # envelope, the command router must never see it.
+            user_text = "\n".join(content_parts) if content_parts else ""
+
             # Extract reply context (parent/root message IDs)
             parent_id = getattr(message, "parent_id", None) or None
             root_id = getattr(message, "root_id", None) or None
@@ -2899,6 +2967,7 @@ class FeishuChannel(BaseChannel):
                     "parent_id": parent_id,
                     "root_id": root_id,
                     "thread_id": thread_id,
+                    "user_text": user_text,
                 }
             )
 

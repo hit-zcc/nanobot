@@ -371,7 +371,7 @@ async def test_send_sanitizes_unresolved_mention_placeholder() -> None:
             metadata={},
         ))
 
-    assert json.loads(sent[0][3])["text"] == "@用户 查清楚了"
+    assert json.loads(sent[0][3])["text"] == "用户 查清楚了"
 
 
 @pytest.mark.asyncio
@@ -427,6 +427,60 @@ async def test_send_keeps_model_written_text_mention() -> None:
     body = json.loads(sent[0][3])["text"]
     assert body == '<at user_id="ou_bob">牛小数</at> 在吗'
     assert body.count("<at") == 1
+
+
+@pytest.mark.asyncio
+async def test_send_upgrades_known_leading_display_mention_to_native_at() -> None:
+    """``@name`` must carry the cached open_id instead of looking clickable only."""
+    channel = _make_feishu_channel(reply_to_message=False)
+    channel._cache_user_name("ou_target", "目标机器人")
+    sent: list[tuple[str, str, str, str]] = []
+
+    with patch.object(
+        channel,
+        "_send_message_sync",
+        side_effect=lambda *args: (sent.append(args), "om_sent")[1],
+    ):
+        await channel.send(OutboundMessage(
+            channel="feishu",
+            chat_id="oc_abc",
+            content="@目标机器人 介绍一下你自己",
+            metadata={"chat_type": "group", "sender_type": "user"},
+        ))
+
+    assert json.loads(sent[0][3])["text"] == (
+        '<at user_id="ou_target">目标机器人</at> 介绍一下你自己'
+    )
+
+
+def test_doubao_open_id_is_available_before_runtime_cache_warms() -> None:
+    channel = _make_feishu_channel(reply_to_message=False)
+    assert channel._open_id_for_display_name("豆包") == (
+        "ou_66244dbc857794ee92956876ab0f022b"
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_drops_fake_at_when_display_name_has_no_open_id() -> None:
+    """An unresolved display name must not be emitted as a fake plain-text @."""
+    channel = _make_feishu_channel(reply_to_message=False)
+    sent: list[tuple[str, str, str, str]] = []
+
+    with patch.object(
+        channel,
+        "_send_message_sync",
+        side_effect=lambda *args: (sent.append(args), "om_sent")[1],
+    ):
+        await channel.send(OutboundMessage(
+            channel="feishu",
+            chat_id="oc_abc",
+            content="@不知道是谁 请看一下",
+            metadata={"chat_type": "group", "sender_type": "user"},
+        ))
+
+    body = json.loads(sent[0][3])["text"]
+    assert body == "不知道是谁 请看一下"
+    assert not body.startswith("@")
 
 
 @pytest.mark.asyncio

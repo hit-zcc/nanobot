@@ -157,6 +157,22 @@ async def test_accept_keeps_system_messages_out_of_interjections() -> None:
         ("@wuw hello", {"mentions": [{"name": "wuw"}]}, "hello"),
         ("mail me at a@b.com", None, "mail me at a@b.com"),
         (None, None, ""),
+        # Feishu wraps the body in a speaker header the model needs; matching
+        # against it made every slash command fall through to the model.
+        (
+            "[Feishu private message \u2014 speaker: x (ou_1); owner: true]\n/model sonnet",
+            {"user_text": "/model sonnet"},
+            "/model sonnet",
+        ),
+        # Group: buffered chatter and the header both sit in front of the text.
+        (
+            "someone said something\n\n[Feishu group message \u2014 speaker: x (ou_1)]\n@wuw /stop",
+            {"user_text": "@wuw /stop", "mentions": [{"name": "wuw"}]},
+            "/stop",
+        ),
+        # An empty/missing user_text must fall back to the content.
+        ("/status", {"user_text": "   "}, "/status"),
+        ("/status", {"user_text": None}, "/status"),
     ],
 )
 def test_command_text_strips_leading_mentions(content, metadata, expected) -> None:

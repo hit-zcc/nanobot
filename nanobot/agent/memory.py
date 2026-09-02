@@ -414,6 +414,32 @@ class MemoryConsolidator:
         self._get_tool_definitions = get_tool_definitions
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
+    def retune(
+        self,
+        *,
+        provider: LLMProvider,
+        model: str,
+        context_window_tokens: int,
+        max_completion_tokens: int,
+    ) -> None:
+        """Point the consolidator at a different model and context window.
+
+        Consolidation runs on whatever model the agent is on, so a `/model`
+        switch has to move it too — left behind, it would keep trimming to the
+        old window and summarizing through the old backend.
+        """
+        self.provider = provider
+        self.model = model
+        self.context_window_tokens = context_window_tokens
+        try:
+            base_max_tokens = int(max_completion_tokens)
+        except (TypeError, ValueError):
+            base_max_tokens = 4096
+        self.max_completion_tokens = base_max_tokens
+        self.consolidation_max_tokens = max(
+            base_max_tokens, self._MIN_CONSOLIDATION_MAX_TOKENS
+        )
+
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
         return self._locks.setdefault(session_key, asyncio.Lock())

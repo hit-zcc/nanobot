@@ -60,10 +60,14 @@ class HeartbeatService:
         interval_s: int = 30 * 60,
         enabled: bool = True,
         timezone: str | None = None,
+        agent: Any | None = None,
     ):
         self.workspace = workspace
-        self.provider = provider
-        self.model = model
+        # Startup fallbacks only. The live pair is read off *agent* per tick —
+        # see the provider/model properties below.
+        self._provider = provider
+        self._model = model
+        self._agent = agent
         self.on_execute = on_execute
         self.on_notify = on_notify
         self.interval_s = interval_s
@@ -71,6 +75,29 @@ class HeartbeatService:
         self.timezone = timezone
         self._running = False
         self._task: asyncio.Task | None = None
+
+    # `/model` rebinds the agent loop's provider and model in place. The
+    # heartbeat used to snapshot both at gateway startup, so after a switch it
+    # kept waking up on the old backend for the rest of the process's life —
+    # hours after every other caller had moved. Resolve them at call time
+    # instead of holding them, exactly like the cron callback does.
+    @property
+    def provider(self) -> LLMProvider:
+        live = getattr(self._agent, "provider", None)
+        return live if live is not None else self._provider
+
+    @provider.setter
+    def provider(self, value: LLMProvider) -> None:
+        self._provider = value
+
+    @property
+    def model(self) -> str:
+        live = getattr(self._agent, "model", None)
+        return live if live else self._model
+
+    @model.setter
+    def model(self, value: str) -> None:
+        self._model = value
 
     @property
     def heartbeat_file(self) -> Path:

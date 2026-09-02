@@ -14,12 +14,13 @@ from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext
-from nanobot.agent.tool_preflight import PreflightEngine, build_playbook_note
-from nanobot.agent.tool_triggers import TriggerEngine, build_reminder_message
 from nanobot.agent.memory import MemoryConsolidator
-from nanobot.agent.runner import AgentRunner, AgentRunSpec
+from nanobot.agent.runner import AgentRunSpec
+from nanobot.agent.runner_factory import build_agent_runner
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tool_preflight import PreflightEngine, build_playbook_note
+from nanobot.agent.tool_triggers import TriggerEngine, build_reminder_message
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
@@ -148,7 +149,7 @@ class AgentLoop:
         self.context = ContextBuilder(workspace, timezone=timezone)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
-        self.runner = AgentRunner(provider)
+        self.runner = build_agent_runner(provider)
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -206,6 +207,35 @@ class AgentLoop:
         self._register_default_tools()
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
+
+    def switch_model(
+        self,
+        provider: LLMProvider,
+        model: str,
+        context_window_tokens: int | None = None,
+    ) -> None:
+        """Rebind this loop to a different provider/model at runtime (`/model`).
+
+        The runner, the subagent manager and the memory consolidator each cached
+        the provider they were built with, so setting ``self.provider`` alone
+        leaves subagents and consolidation calls talking to the old backend —
+        with the new model's name, which the old backend does not know. Every
+        holder is rebound here, together.
+        """
+        self.provider = provider
+        self.model = model
+        self.runner = build_agent_runner(provider)
+        self.subagents.provider = provider
+        self.subagents.model = model
+        self.subagents.runner = build_agent_runner(provider)
+        if context_window_tokens and context_window_tokens > 0:
+            self.context_window_tokens = context_window_tokens
+        self.memory_consolidator.retune(
+            provider=provider,
+            model=model,
+            context_window_tokens=self.context_window_tokens,
+            max_completion_tokens=provider.generation.max_tokens,
+        )
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -858,6 +888,23 @@ class AgentLoop:
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
 
+    async def _maybe_consolidate_memory(self, session: Session) -> None:
+        """Run nanobot's tool-based compaction only on its native agent loop.
+
+        The Agent SDK owns its internal tool loop, while nanobot sends it the
+        complete persisted transcript for each turn. Calling the legacy memory
+        tool path through the SDK provider would create a second, incompatible
+        agent loop. Existing providers, including Codex, remain unchanged.
+        """
+        if getattr(self.provider, "uses_agent_sdk", False) is not True:
+            await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+
+    def _schedule_memory_consolidation(self, session: Session) -> None:
+        if getattr(self.provider, "uses_agent_sdk", False) is not True:
+            self._schedule_background(
+                self.memory_consolidator.maybe_consolidate_by_tokens(session)
+            )
+
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
@@ -883,7 +930,7 @@ class AgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
-            await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+            await self._maybe_consolidate_memory(session)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=0)
             # Background results enter as a user turn, not an assistant one.
@@ -914,7 +961,7 @@ class AgentLoop:
                 raise
             self._save_turn(session, all_msgs, cursor[0])
             self.sessions.save(session)
-            self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
+            self._schedule_memory_consolidation(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
@@ -941,7 +988,7 @@ class AgentLoop:
                     metadata=dict(msg.metadata or {}),
                 )
 
-        await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+        await self._maybe_consolidate_memory(session)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
@@ -1054,7 +1101,7 @@ class AgentLoop:
 
         self._save_turn(session, all_msgs, cursor[0])
         self.sessions.save(session)
-        self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
+        self._schedule_memory_consolidation(session)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None

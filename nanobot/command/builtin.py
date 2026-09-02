@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
+from pathlib import Path
+from typing import Any
 
 from loguru import logger
 
@@ -112,6 +115,117 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+def _text_reply(ctx: CommandContext, content: str) -> OutboundMessage:
+    """Reply with plain text, bypassing any channel-side markdown rendering."""
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
+        metadata={"render_as": "text"},
+    )
+
+
+def _describe_preset(name: str, preset: Any) -> str:
+    """One list line for a preset: name, model, and its own description."""
+    suffix = f" — {preset.description}" if preset.description else ""
+    return f"  {name} → {preset.model}{suffix}"
+
+
+def _persist_defaults(path: Path, overrides: dict[str, Any]) -> str | None:
+    """Patch `agents.defaults` in the config file. Returns an error, or None.
+
+    The file is edited key by key rather than re-serialized from the loaded
+    Config: a round-trip would rewrite every channel and provider section, so a
+    single unrecognized key anywhere in the user's file would be dropped by a
+    model switch.
+    """
+    from pydantic.alias_generators import to_camel
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        defaults = raw.setdefault("agents", {}).setdefault("defaults", {})
+        for key, value in overrides.items():
+            # Written back under whichever spelling the file already uses, so a
+            # snake_case config does not grow a second camelCase copy of a key.
+            defaults[to_camel(key) if key not in defaults else key] = value
+        path.write_text(
+            json.dumps(raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+    except Exception as exc:  # a live switch must not fail over a save
+        logger.warning("/model: could not persist to {}: {}", path, exc)
+        return str(exc)
+    return None
+
+
+async def cmd_model(ctx: CommandContext) -> OutboundMessage:
+    """Show the current model, or switch this agent to another one.
+
+    `/model` lists what is available, `/model <preset>` switches to a preset
+    from ``agents.presets``, and `/model <provider>/<name>` switches to any
+    model the registry can route without needing a preset.
+    """
+    from nanobot.config.loader import get_config_path, load_config
+    from nanobot.providers.factory import ProviderConfigError, build_provider
+
+    loop = ctx.loop
+    arg = (ctx.args or "").strip()
+    config = load_config()
+    presets = config.agents.presets
+
+    if not arg:
+        lines = [f"\U0001f9e0 Model: {loop.model}"]
+        if presets:
+            lines.append("Presets:")
+            lines += [_describe_preset(name, p) for name, p in presets.items()]
+            lines.append("Switch with: /model <preset> or /model <provider>/<model>")
+        else:
+            lines.append("No presets configured (agents.presets in the config file).")
+            lines.append("Switch with: /model <provider>/<model>")
+        return _text_reply(ctx, "\n".join(lines))
+
+    matched = next(
+        ((name, p) for name, p in presets.items() if name.lower() == arg.lower()), None
+    )
+    if matched is None and "/" not in arg:
+        lines = [f"Unknown model preset: {arg}"]
+        if presets:
+            lines.append("Available:")
+            lines += [_describe_preset(name, p) for name, p in presets.items()]
+        lines.append("Or give a full id: /model <provider>/<model>")
+        return _text_reply(ctx, "\n".join(lines))
+
+    if matched is not None:
+        preset_name, preset = matched
+        overrides = preset.overrides()
+    else:
+        # A fully-qualified id carries its own provider prefix. Any forced
+        # `provider` from the previous model would override that prefix and
+        # send the new model name to the old backend, so it is cleared.
+        preset_name, overrides = None, {"model": arg, "provider": "auto"}
+
+    config.agents.defaults = config.agents.defaults.model_copy(update=overrides)
+    defaults = config.agents.defaults
+    try:
+        provider = build_provider(config)
+    except ProviderConfigError as exc:
+        return _text_reply(ctx, "\n".join(
+            [f"Cannot switch to {defaults.model}: {exc.message}", *exc.hints]
+        ))
+
+    previous = loop.model
+    loop.switch_model(provider, defaults.model, defaults.context_window_tokens)
+
+    label = f"{defaults.model} (preset: {preset_name})" if preset_name else defaults.model
+    lines = [f"\U0001f9e0 Model: {label}", f"Was: {previous}"]
+    if error := _persist_defaults(get_config_path(), overrides):
+        lines.append(f"⚠️ Active now, but not saved to the config file: {error}")
+    elif len(config.agents.agents) > 1:
+        lines.append("Saved as the default; other agents switch on next restart.")
+    else:
+        lines.append("Saved as the default for the next restart.")
+    return _text_reply(ctx, "\n".join(lines))
+
+
 async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     """Return available slash commands."""
     lines = [
@@ -120,6 +234,7 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
         "/stop — Stop the current task",
         "/restart — Restart the bot",
         "/status — Show bot status",
+        "/model — Show or switch the model (e.g. /model claude)",
         "/help — Show available commands",
     ]
     return OutboundMessage(
@@ -138,3 +253,5 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/new", cmd_new)
     router.exact("/status", cmd_status)
     router.exact("/help", cmd_help)
+    router.exact("/model", cmd_model)
+    router.prefix("/model ", cmd_model)

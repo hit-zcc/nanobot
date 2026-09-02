@@ -24,11 +24,21 @@ def command_text(content: str | None, metadata: dict[str, Any] | None = None) ->
     because they may contain spaces; whatever is left falls back to a generic
     "@token" match.  Only the text used for matching is normalized -- the model
     still sees the original message.
+
+    A channel may also wrap the body in context the model needs but the command
+    router must not see -- a speaker identity header, a quoted reply, buffered
+    group chatter.  Such a channel puts the user's own text in
+    ``metadata["user_text"]``, and that is what commands match against.
     """
-    text = (content or "").strip()
+    meta = metadata or {}
+    user_text = meta.get("user_text")
+    if isinstance(user_text, str) and user_text.strip():
+        text = user_text.strip()
+    else:
+        text = (content or "").strip()
     names = [
         str(mention.get("name") or "")
-        for mention in (metadata or {}).get("mentions") or []
+        for mention in meta.get("mentions") or []
         if isinstance(mention, dict)
     ]
     peeled = True

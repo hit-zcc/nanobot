@@ -376,84 +376,16 @@ def _onboard_plugins(config_path: Path) -> None:
 
 
 def _make_provider(config: Config):
-    """Create the appropriate LLM provider from config.
+    """Create the LLM provider from config, reporting failures on the console."""
+    from nanobot.providers.factory import ProviderConfigError, build_provider
 
-    Routing is driven by ``ProviderSpec.backend`` in the registry.
-    """
-    from nanobot.providers.base import GenerationSettings
-    from nanobot.providers.registry import find_by_name
-
-    model = config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
-    spec = find_by_name(provider_name) if provider_name else None
-    backend = spec.backend if spec else "openai_compat"
-
-    # --- validation ---
-    if backend == "azure_openai":
-        if not p or not p.api_key or not p.api_base:
-            console.print("[red]Error: Azure OpenAI requires api_key and api_base.[/red]")
-            console.print("Set them in ~/.nanobot/config.json under providers.azure_openai section")
-            console.print("Use the model field to specify the deployment name.")
-            raise typer.Exit(1)
-    elif backend == "openai_compat" and not model.startswith("bedrock/"):
-        needs_key = not (p and p.api_key)
-        exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
-        if needs_key and not exempt:
-            console.print("[red]Error: No API key configured.[/red]")
-            console.print("Set one in ~/.nanobot/config.json under providers section")
-            raise typer.Exit(1)
-
-    # --- instantiation by backend ---
-    if backend == "claude_oauth":
-        from nanobot.providers.claude_oauth_provider import ClaudeOAuthProvider, _load_token
-        if _load_token() is None:
-            console.print("[red]Error: Claude OAuth (subscription) not logged in.[/red]")
-            console.print("Run: [bold]nanobot provider login claude-oauth[/bold]")
-            console.print(
-                "Or switch to an API key: set model to 'anthropic/claude-opus-4-5' "
-                "and ANTHROPIC_API_KEY (or providers.anthropic.apiKey)."
-            )
-            raise typer.Exit(1)
-        provider = ClaudeOAuthProvider(default_model=model)
-    elif backend == "openai_codex":
-        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
-        provider = OpenAICodexProvider(
-            default_model=model,
-            service_tier=config.agents.defaults.service_tier,
-        )
-    elif backend == "azure_openai":
-        from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
-        provider = AzureOpenAIProvider(
-            api_key=p.api_key,
-            api_base=p.api_base,
-            default_model=model,
-        )
-    elif backend == "anthropic":
-        from nanobot.providers.anthropic_provider import AnthropicProvider
-        provider = AnthropicProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-        )
-    else:
-        from nanobot.providers.openai_compat_provider import OpenAICompatProvider
-        provider = OpenAICompatProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-            spec=spec,
-        )
-
-    defaults = config.agents.defaults
-    provider.generation = GenerationSettings(
-        temperature=defaults.temperature,
-        max_tokens=defaults.max_tokens,
-        reasoning_effort=defaults.reasoning_effort,
-    )
-    return provider
+    try:
+        return build_provider(config)
+    except ProviderConfigError as exc:
+        console.print(f"[red]Error: {exc.message}[/red]")
+        for hint in exc.hints:
+            console.print(hint)
+        raise typer.Exit(1) from None
 
 
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
@@ -510,7 +442,11 @@ def _migrate_cron_store(config: "Config") -> None:
 
 
 def _make_cron_callback(agent, bus, provider):
-    """Create a cron callback bound to one agent."""
+    """Create a cron callback bound to one agent.
+
+    *provider* is only the startup provider: `/model` rebinds ``agent.provider``
+    mid-run, so the live one is read off the agent at fire time.
+    """
 
     async def on_cron_job(job):
         from nanobot.agent.tools.cron import CronTool
@@ -545,7 +481,7 @@ def _make_cron_callback(agent, bus, provider):
 
         if job.payload.deliver and job.payload.to and response:
             should_notify = await evaluate_response(
-                response, job.payload.message, provider, agent.model,
+                response, job.payload.message, agent.provider or provider, agent.model,
             )
             if should_notify:
                 await bus.publish_outbound(OutboundMessage(
@@ -758,6 +694,9 @@ def gateway(
         workspace=heartbeat_agent.workspace,
         provider=provider,
         model=heartbeat_agent.model,
+        # Follow `/model` on the heartbeat's own agent instead of freezing the
+        # startup provider/model pair here.
+        agent=heartbeat_agent,
         on_execute=on_heartbeat_execute,
         on_notify=on_heartbeat_notify,
         interval_s=hb_cfg.interval_s,

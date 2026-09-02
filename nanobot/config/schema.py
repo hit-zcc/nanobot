@@ -69,12 +69,37 @@ class BindingConfig(Base):
     chat_id: str | None = None
 
 
+class ModelPreset(Base):
+    """A named model setup that `/model <name>` switches the running agent to.
+
+    Only the fields that are set are applied over ``agents.defaults``; the rest
+    of the defaults (workspace, timezone, iteration caps, …) carry over, so a
+    preset stays a description of *the model* rather than a second config.
+    """
+
+    model: str
+    provider: str | None = None
+    max_tokens: int | None = None
+    context_window_tokens: int | None = None
+    reasoning_effort: str | None = None
+    service_tier: str | None = None
+    description: str = ""
+
+    def overrides(self) -> dict[str, object]:
+        """Return the `agents.defaults` fields this preset sets."""
+        fields = ("model", "provider", "max_tokens", "context_window_tokens",
+                  "reasoning_effort", "service_tier")
+        return {f: getattr(self, f) for f in fields if getattr(self, f) is not None}
+
+
 class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
     agents: list[AgentConfig] = Field(default_factory=list, alias="list")
     bindings: list[BindingConfig] = Field(default_factory=list)
+    # Named model setups for the /model command, e.g. {"claude": {...}}.
+    presets: dict[str, ModelPreset] = Field(default_factory=dict)
 
 
 class ProviderConfig(Base):
@@ -91,6 +116,7 @@ class ProvidersConfig(Base):
     custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
     azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
+    claude_agent_sdk: ProviderConfig = Field(default_factory=ProviderConfig)  # Official Agent SDK/Claude CLI auth
     claude_oauth: ProviderConfig = Field(default_factory=ProviderConfig)  # Claude OAuth (Max/Pro subscription, no API key)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
     openrouter: ProviderConfig = Field(default_factory=ProviderConfig)

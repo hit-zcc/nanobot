@@ -184,7 +184,17 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
 
 
     # === Standard providers (matched by model-name keywords) ===============
-    # Claude OAuth: uses a Claude Max/Pro subscription via OAuth PKCE (no API key)
+    # Claude Agent SDK: official SDK + Claude CLI authentication (no API key)
+    ProviderSpec(
+        name="claude_agent_sdk",
+        keywords=("claude-agent-sdk", "claude_agent_sdk", "claude-sdk"),
+        env_key="",
+        display_name="Claude Agent SDK",
+        backend="claude_agent_sdk",
+        is_oauth=True,
+        supports_prompt_caching=True,
+    ),
+    # Claude OAuth: legacy direct subscription-token integration (no API key)
     ProviderSpec(
         name="claude_oauth",
         keywords=("claude-oauth", "claude_oauth"),
